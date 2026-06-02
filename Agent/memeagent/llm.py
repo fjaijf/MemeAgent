@@ -30,6 +30,8 @@ def create_llm(config: MemeAgentConfig) -> ChatOpenAI:
         "model": config.model,
         "api_key": api_key,
         "temperature": config.temperature,
+        "timeout": config.timeout,
+        "max_retries": config.max_retries,
     }
     if config.base_url:
         kwargs["base_url"] = config.base_url
