@@ -57,6 +57,7 @@ def main() -> None:
         SearchAgentConfig(
             search_provider=config.search_provider,
             search_api_key=config.search_api_key,
+            zhihu_api_key=config.zhihu_api_key,
             search_proxy=config.search_proxy,
             search_max_results=config.search_max_results,
             news_max_results=config.news_max_results,

@@ -14,6 +14,7 @@ class MemeAgentConfig:
     max_retries: int
     search_provider: str
     search_api_key: str | None
+    zhihu_api_key: str | None
     search_proxy: str | None
     search_max_results: int
     news_max_results: int
@@ -37,6 +38,10 @@ class MemeAgentConfig:
             search_provider=os.getenv("MEMEAGENT_SEARCH_PROVIDER", "ddgs").strip(),
             search_api_key=(
                 os.getenv("MEMEAGENT_SEARCH_API_KEY", "").strip().strip('"').strip("'")
+                or None
+            ),
+            zhihu_api_key=(
+                os.getenv("MEMEAGENT_ZHIHU_API_KEY", "").strip().strip('"').strip("'")
                 or None
             ),
             search_proxy=(

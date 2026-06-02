@@ -50,6 +50,13 @@ The default search provider is `ddgs`, which does not require an API key:
 MEMEAGENT_SEARCH_PROVIDER=ddgs
 ```
 
+You can combine providers with commas. For example, use DDGS and Zhihu together:
+
+```bash
+MEMEAGENT_SEARCH_PROVIDER=ddgs,zhihu
+MEMEAGENT_ZHIHU_API_KEY=your_zhihu_access_secret
+```
+
 For a more stable all-web search API, use Brave Search:
 
 ```bash
@@ -62,6 +69,13 @@ Or use Tavily, which is designed for agent/RAG search workflows:
 ```bash
 MEMEAGENT_SEARCH_PROVIDER=tavily
 MEMEAGENT_SEARCH_API_KEY=your_tavily_api_key
+```
+
+To use Zhihu's official search API:
+
+```bash
+MEMEAGENT_SEARCH_PROVIDER=zhihu
+MEMEAGENT_ZHIHU_API_KEY=your_zhihu_access_secret
 ```
 
 If the selected search API needs a local HTTP proxy, set:
