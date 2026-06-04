@@ -6,6 +6,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from memeagent.agent import MemeAgent
+from memeagent.cli_ui import MemeAgentCLI, RunSummary
 from memeagent.config import MemeAgentConfig
 from memeagent.llm import create_llm
 from memeagent.search_agent import SearchAgentConfig, WebSearchAgent
@@ -42,6 +43,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print the search report before the final analysis result.",
     )
+    parser.add_argument(
+        "--plain",
+        action="store_true",
+        help="Disable rich terminal visuals and print plain text output.",
+    )
     return parser.parse_args()
 
 
@@ -68,33 +74,46 @@ def main() -> None:
         )
     )
     workflow = MemeResearchWorkflow(meme_agent=agent, search_agent=search_agent)
+    ui = MemeAgentCLI(enabled=not args.plain)
 
     try:
-        print(
-            f"Starting MemeAgent request with model={config.model}, "
-            f"images={len(args.image) + len(args.image_url)}, timeout={config.timeout}s..."
-        )
-        if args.search:
-            print(
-                f"Web search enabled with provider={config.search_provider}: "
-                f"up to {config.search_max_results} web results, "
-                f"{config.news_max_results} news results, search timeout={config.search_timeout}s."
+        ui.print_start(
+            RunSummary(
+                model=config.model,
+                image_count=len(args.image) + len(args.image_url),
+                timeout=config.timeout,
+                search_enabled=args.search,
+                search_provider=config.search_provider,
+                web_results=config.search_max_results,
+                news_results=config.news_max_results,
+                search_timeout=config.search_timeout,
             )
+        )
+        ui.start_activity()
         result = workflow.run(
             topic=args.topic,
             context=args.context,
             image_paths=args.image,
             image_urls=args.image_url,
             use_search=args.search,
+            progress=ui.update,
         )
-        if args.search and args.show_search and result.search_report:
-            print("\n=== Search Report ===")
-            print(result.search_report)
-            print("\n=== Final Analysis ===")
-        print(result.analysis)
+        ui.stop_activity()
+        ui.print_result(
+            analysis=result.analysis,
+            input_mode=result.input_mode,
+            search_report=result.search_report,
+            visual_report=result.visual_report,
+            show_search=args.search and args.show_search,
+        )
     except KeyboardInterrupt:
-        print("\nInterrupted by user.")
+        ui.stop_activity()
+        ui.print_error("\nInterrupted by user.")
         raise SystemExit(130)
+    except Exception as exc:
+        ui.stop_activity()
+        ui.print_error(f"MemeAgent failed: {exc}")
+        raise
 
 
 if __name__ == "__main__":

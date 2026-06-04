@@ -1,7 +1,7 @@
 # MemeAgent
 
-`MemeAgent` is a minimal agent scaffold modeled after the way `TradingAgents`
-creates and calls LLMs:
+`MemeAgent` is a minimal agent scaffold for meme studies and online discourse
+analysis, modeled after the way `TradingAgents` creates and calls LLMs:
 
 1. Load config
 2. Create an LLM client
@@ -33,16 +33,69 @@ pip install -r requirements.txt
 python main.py --topic "PEPE"
 ```
 
+Before development, run a quick smoke test for the LLM and search provider:
+
+```bash
+python test_smoke.py
+```
+
+You can test only one side if needed:
+
+```bash
+python test_smoke.py --skip-search
+python test_smoke.py --skip-llm
+```
+
+If final analysis times out on image-heavy runs, increase the timeout or limit
+generation length:
+
+```bash
+MEMEAGENT_TIMEOUT=180
+MEMEAGENT_MAX_TOKENS=1200
+```
+
 To search the public web first and feed the results into the analysis:
 
 ```bash
 python main.py --topic "PEPE" --search --show-search
 ```
 
-The search agent currently gathers:
+The CLI shows a terminal status panel and live activity indicator while it waits
+for image pre-analysis, retrieval, and final LLM analysis. For plain text output
+in logs or batch jobs, add:
+
+```bash
+python main.py --topic "PEPE" --search --show-search --plain
+```
+
+MemeAgent supports three input modes:
+
+```bash
+# Text only: search from topic/context, then analyze.
+python main.py --topic "a meme name or phrase" --search --show-search
+
+# Image only: describe the image, search from extracted OCR/keywords, then analyze.
+python main.py --image path/to/meme.png --search --show-search
+
+# Text and image: combine the text hint with image-derived keywords.
+python main.py --topic "a meme name or phrase" --image path/to/meme.png --search --show-search
+```
+
+When images are attached, MemeAgent first asks the vision model to produce an
+OCR/visual-description/keyword report. That image-derived report is then used
+as additional search context before the final meme analysis:
+
+```bash
+python main.py --image path/to/meme.png --search --show-search
+```
+
+The search agent currently gathers research context for:
 
 - public web search results
 - public news results
+- meme harmfulness and risk analysis
+- sentiment, audience reception, and intent recognition
+- meme evolution and cross-platform discourse tracking
 
 The default search provider is `ddgs`, which does not require an API key:
 

@@ -22,6 +22,12 @@ _BRAVE_NEWS_API = "https://api.search.brave.com/res/v1/news/search"
 _TAVILY_SEARCH_API = "https://api.tavily.com/search"
 _ZHIHU_SEARCH_API = "https://developer.zhihu.com/api/v1/content/zhihu_search"
 
+_RESEARCH_QUERY_SUFFIXES = (
+    "meme harmfulness sentiment audience intent evolution discourse analysis",
+    "meme risk emotional reaction audience interpretation intent",
+    "meme controversy social impact reception meaning transformation",
+)
+
 
 @dataclass(frozen=True)
 class SearchAgentConfig:
@@ -43,22 +49,47 @@ def _clean_text(value: Any) -> str:
     return str(value).strip()
 
 
+def _compact_query_text(value: str, max_chars: int = 220) -> str:
+    return " ".join(value.split())[:max_chars].strip()
+
+
 class WebSearchAgent:
     """Small retrieval agent that gathers public web and news context."""
 
     def __init__(self, config: SearchAgentConfig) -> None:
         self.config = config
 
-    def _build_query(self, topic: str, context: str = "") -> str:
-        topic = _clean_text(topic)
-        context = _clean_text(context)
-        if topic and context:
-            return f"{topic} {context} meme coin crypto community sentiment"
-        if topic:
-            return f"{topic} meme coin crypto community sentiment"
-        if context:
-            return context
-        return "crypto meme coin sentiment"
+    def _build_queries(self, topic: str, context: str = "") -> list[str]:
+        topic = _compact_query_text(_clean_text(topic), max_chars=120)
+        context = _compact_query_text(_clean_text(context), max_chars=220)
+        base = " ".join(part for part in (topic, context) if part) or "meme"
+
+        queries = [
+            f"{base} {_RESEARCH_QUERY_SUFFIXES[0]}",
+            f"{base} {_RESEARCH_QUERY_SUFFIXES[1]}",
+            f"{base} {_RESEARCH_QUERY_SUFFIXES[2]}",
+        ]
+        return list(dict.fromkeys(query for query in queries if query.strip()))
+
+    def _build_news_queries(self, queries: list[str]) -> list[str]:
+        bases: list[str] = []
+        for query in queries:
+            base = _clean_text(query)
+            for suffix in _RESEARCH_QUERY_SUFFIXES:
+                marker = f" {suffix}"
+                if base.endswith(marker):
+                    base = base[: -len(marker)].strip()
+                    break
+            if base:
+                bases.append(base)
+
+        base = bases[0] if bases else "meme"
+        news_queries = [
+            f"{base} meme news",
+            f"{base} meme controversy",
+            f"{base} social media reaction",
+        ]
+        return list(dict.fromkeys(query for query in news_queries if query.strip()))
 
     def _open_url(self, req: Request, data: bytes | None = None):
         if self.config.search_proxy:
@@ -90,18 +121,30 @@ class WebSearchAgent:
             try:
                 results.extend(self._search_text_provider(provider, query))
             except Exception as exc:
-                logger.warning("Web search provider %s failed for query=%s: %s", provider, query, exc)
+                logger.debug(
+                    "Web search provider %s failed for query=%s: %s",
+                    provider,
+                    query,
+                    exc,
+                )
                 errors.append(f"{provider}: {exc}")
 
         if not results and errors:
             raise ValueError("; ".join(errors))
         return results
 
-    def _search_text_provider(self, provider: str, query: str) -> list[dict[str, Any]]:
+    def _search_text_provider(
+        self,
+        provider: str,
+        query: str,
+    ) -> list[dict[str, Any]]:
         if provider == "ddgs":
             return self._search_ddgs_text(query)
         if provider == "brave":
-            return self._search_brave(query, max_results=self.config.search_max_results)
+            return self._search_brave(
+                query,
+                max_results=self.config.search_max_results,
+            )
         if provider == "tavily":
             return self._search_tavily(
                 query,
@@ -109,7 +152,10 @@ class WebSearchAgent:
                 topic="general",
             )
         if provider == "zhihu":
-            return self._search_zhihu(query, max_results=self.config.search_max_results)
+            return self._search_zhihu(
+                query,
+                max_results=self.config.search_max_results,
+            )
         raise ValueError(
             f"Unsupported search provider '{provider}'. "
             "Use ddgs, brave, tavily, or zhihu."
@@ -123,14 +169,23 @@ class WebSearchAgent:
             try:
                 results.extend(self._search_news_provider(provider, query))
             except Exception as exc:
-                logger.warning("News search provider %s failed for query=%s: %s", provider, query, exc)
+                logger.debug(
+                    "News search provider %s failed for query=%s: %s",
+                    provider,
+                    query,
+                    exc,
+                )
                 errors.append(f"{provider}: {exc}")
 
         if not results and errors:
             raise ValueError("; ".join(errors))
         return results
 
-    def _search_news_provider(self, provider: str, query: str) -> list[dict[str, Any]]:
+    def _search_news_provider(
+        self,
+        provider: str,
+        query: str,
+    ) -> list[dict[str, Any]]:
         if provider == "ddgs":
             return self._search_ddgs_news(query)
         if provider == "brave":
@@ -153,12 +208,39 @@ class WebSearchAgent:
         )
 
     def _search_ddgs_text(self, query: str) -> list[dict[str, Any]]:
-        with DDGS() as ddgs:
+        with self._open_ddgs() as ddgs:
             return list(ddgs.text(query, max_results=self.config.search_max_results))
 
     def _search_ddgs_news(self, query: str) -> list[dict[str, Any]]:
-        with DDGS() as ddgs:
+        with self._open_ddgs() as ddgs:
             return list(ddgs.news(query, max_results=self.config.news_max_results))
+
+    def _open_ddgs(self):
+        candidates: list[dict[str, Any]] = []
+        if self.config.search_proxy:
+            candidates.extend(
+                [
+                    {
+                        "proxy": self.config.search_proxy,
+                        "timeout": self.config.search_timeout,
+                    },
+                    {
+                        "proxies": self.config.search_proxy,
+                        "timeout": self.config.search_timeout,
+                    },
+                    {"proxy": self.config.search_proxy},
+                    {"proxies": self.config.search_proxy},
+                ]
+            )
+        candidates.extend([{"timeout": self.config.search_timeout}, {}])
+
+        for kwargs in candidates:
+            try:
+                return DDGS(**kwargs)
+            except TypeError:
+                continue
+
+        return DDGS()
 
     def _search_brave(
         self,
@@ -254,7 +336,8 @@ class WebSearchAgent:
         api_key = self.config.zhihu_api_key or self.config.search_api_key
         if not api_key:
             raise ValueError(
-                "MEMEAGENT_ZHIHU_API_KEY or MEMEAGENT_SEARCH_API_KEY is required for Zhihu search"
+                "MEMEAGENT_ZHIHU_API_KEY or MEMEAGENT_SEARCH_API_KEY "
+                "is required for Zhihu search"
             )
 
         qs = urlencode({"Query": query})
@@ -331,7 +414,68 @@ class WebSearchAgent:
             "date": date,
         }
 
-    def _run_with_timeout(self, fn, query: str, label: str) -> tuple[list[dict[str, Any]], str | None]:
+    def _search_text_queries(self, queries: list[str]) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        errors: list[str] = []
+
+        for query in queries:
+            try:
+                results.extend(self._search_text(query))
+            except Exception as exc:
+                logger.debug("Web search failed for query=%s: %s", query, exc)
+                errors.append(f"{query}: {exc}")
+
+        if not results and errors:
+            raise ValueError("; ".join(errors))
+        return self._dedupe_results(
+            results,
+            max_results=self.config.search_max_results * len(self._search_providers()),
+        )
+
+    def _search_news_queries(self, queries: list[str]) -> list[dict[str, Any]]:
+        news_queries = self._build_news_queries(queries)[:2]
+        results: list[dict[str, Any]] = []
+        errors: list[str] = []
+
+        for query in news_queries:
+            try:
+                results.extend(self._search_news(query))
+            except Exception as exc:
+                logger.debug("News search failed for query=%s: %s", query, exc)
+                errors.append(f"{query}: {exc}")
+
+        if not results and errors:
+            raise ValueError("; ".join(errors))
+        return self._dedupe_results(results, max_results=self.config.news_max_results)
+
+    def _dedupe_results(
+        self,
+        results: list[dict[str, Any]],
+        max_results: int,
+    ) -> list[dict[str, Any]]:
+        deduped: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        for item in results:
+            href = _clean_text(item.get("href") or item.get("url"))
+            title = _clean_text(item.get("title")).lower()
+            key = href or title
+            if not key or key in seen:
+                continue
+
+            seen.add(key)
+            deduped.append(item)
+            if len(deduped) >= max_results:
+                break
+
+        return deduped
+
+    def _run_with_timeout(
+        self,
+        fn,
+        query,
+        label: str,
+    ) -> tuple[list[dict[str, Any]], str | None]:
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(fn, query)
             try:
@@ -340,25 +484,29 @@ class WebSearchAgent:
                 future.cancel()
                 return [], f"{label} timed out after {self.config.search_timeout:.0f}s"
             except Exception as exc:
-                logger.warning("%s failed for query=%s: %s", label, query, exc)
+                logger.debug("%s failed for query=%s: %s", label, query, exc)
                 return [], f"{label} failed: {exc}"
 
     def run(self, topic: str, context: str = "") -> str:
-        query = self._build_query(topic, context)
+        queries = self._build_queries(topic, context)
 
         sections: list[str] = [
             f"Search provider: {self.config.search_provider}",
-            f"Search query: {query}",
+            "Search queries:\n" + "\n".join(f"- {query}" for query in queries),
         ]
 
         text_results, text_error = self._run_with_timeout(
-            self._search_text, query, "Web search"
+            self._search_text_queries,
+            queries,
+            "Web search",
         )
         if text_error:
             sections.append(text_error)
 
         news_results, news_error = self._run_with_timeout(
-            self._search_news, query, "News search"
+            self._search_news_queries,
+            queries,
+            "News search",
         )
         if news_error:
             sections.append(news_error)

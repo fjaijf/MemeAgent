@@ -11,6 +11,7 @@ class MemeAgentConfig:
     base_url: str | None
     temperature: float
     timeout: float
+    max_tokens: int | None
     max_retries: int
     search_provider: str
     search_api_key: str | None
@@ -28,12 +29,15 @@ class MemeAgentConfig:
     def from_env(cls) -> "MemeAgentConfig":
         base_url = (os.getenv("OPENAI_BASE_URL") or "").strip().strip('"').strip("'")
         model = (os.getenv("MEMEAGENT_MODEL") or "gpt-4o-mini").strip()
+        raw_max_tokens = (os.getenv("MEMEAGENT_MAX_TOKENS") or "0").strip()
+        max_tokens_value = int(raw_max_tokens) if raw_max_tokens else 0
         return cls(
             provider="openai",
             model=model,
             base_url=base_url or None,
             temperature=float(os.getenv("MEMEAGENT_TEMPERATURE", "0.2")),
             timeout=float(os.getenv("MEMEAGENT_TIMEOUT", "60")),
+            max_tokens=max_tokens_value if max_tokens_value > 0 else None,
             max_retries=int(os.getenv("MEMEAGENT_MAX_RETRIES", "0")),
             search_provider=os.getenv("MEMEAGENT_SEARCH_PROVIDER", "ddgs").strip(),
             search_api_key=(
@@ -55,8 +59,11 @@ class MemeAgentConfig:
             search_lang=os.getenv("MEMEAGENT_SEARCH_LANG", "en").strip(),
             tavily_search_depth=os.getenv("MEMEAGENT_TAVILY_SEARCH_DEPTH", "basic").strip(),
             system_prompt=(
-                "You are MemeAgent, a crypto-native research assistant. "
-                "Analyze meme-driven narratives, community momentum, risks, and "
-                "near-term speculation clearly and without hype."
+                "You are MemeAgent, a research assistant for meme studies and "
+                "online discourse analysis. Analyze memes with attention to "
+                "harmfulness, sentiment, audience reception, intent, cultural "
+                "context, and evolution across platforms. Keep evidence and "
+                "inference clearly separated, avoid hype, and do not default to "
+                "finance or crypto framing unless the evidence requires it."
             ),
         )
