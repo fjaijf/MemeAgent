@@ -45,6 +45,26 @@ class OpenAICompatibleChatClient:
         content = response.choices[0].message.content or ""
         return ChatResponse(content=content)
 
+    def stream(self, messages: list[Any]):
+        request_kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": [self._convert_message(message) for message in messages],
+            "temperature": self.temperature,
+            "stream": True,
+        }
+        if self.max_tokens is not None:
+            request_kwargs["max_tokens"] = self.max_tokens
+
+        for chunk in self.client.chat.completions.create(**request_kwargs):
+            if not getattr(chunk, "choices", None):
+                continue
+            delta = getattr(chunk.choices[0], "delta", None)
+            if delta is None:
+                continue
+            content = getattr(delta, "content", None)
+            if content:
+                yield content
+
     def _convert_message(self, message: Any) -> dict[str, Any]:
         if isinstance(message, SystemMessage):
             return {"role": "system", "content": message.content}

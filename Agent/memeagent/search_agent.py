@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from dataclasses import dataclass
 import json
 import logging
+import re
 import time
 from typing import Any
 from urllib.parse import urlencode
@@ -53,14 +54,99 @@ def _compact_query_text(value: str, max_chars: int = 220) -> str:
     return " ".join(value.split())[:max_chars].strip()
 
 
+def _dedupe_strings(values: list[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        cleaned = _compact_query_text(value, max_chars=160)
+        key = cleaned.lower()
+        if not cleaned or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(cleaned)
+    return deduped
+
+
+def _is_none_query(value: str) -> bool:
+    normalized = value.strip().strip("-*").strip().lower()
+    return normalized in {"none", "n/a", "na", "无", "没有", "无需", "无补充"}
+
+
+def _normalize_section_heading(value: str) -> str:
+    heading = re.sub(r"^#+\s*", "", value.strip())
+    heading = re.sub(r"^\d+[.)、]\s*", "", heading)
+    return heading.rstrip(":：").strip().lower()
+
+
 class WebSearchAgent:
     """Small retrieval agent that gathers public web and news context."""
 
     def __init__(self, config: SearchAgentConfig) -> None:
         self.config = config
 
+    def _extract_supplemental_queries(
+        self,
+        context: str,
+        section_name: str,
+        limit: int,
+    ) -> list[str]:
+        queries: list[str] = []
+        in_section = False
+
+        for raw_line in context.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            heading = _normalize_section_heading(line)
+            if heading == section_name.lower():
+                in_section = True
+                continue
+
+            if in_section and re.match(r"^[A-Z_ ]+[:：]$", line):
+                in_section = False
+                continue
+
+            if in_section and re.match(r"^(\d+\.|[-*]\s+)", line):
+                query = re.sub(r"^(\d+\.\s*|[-*]\s+)", "", line).strip()
+                if query and not _is_none_query(query):
+                    queries.append(query)
+
+        return _dedupe_strings(queries)[:limit]
+
+    def _extract_visual_search_anchors(self, context: str) -> list[str]:
+        anchors: list[str] = []
+        anchors.extend(re.findall(r'"([^"]{2,120})"', context))
+
+        in_suggested_queries = False
+        for raw_line in context.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            lower_line = line.lower()
+            if (
+                "suggested retrieval queries" in lower_line
+                or "suggested search queries" in lower_line
+            ):
+                in_suggested_queries = True
+                continue
+            if in_suggested_queries and re.match(r"^(\d+\.|[-*]\s+)", line):
+                anchors.append(re.sub(r"^(\d+\.\s*|[-*]\s+)", "", line).strip())
+                continue
+            if in_suggested_queries and re.match(r"^[A-Z][A-Za-z /-]+:", line):
+                in_suggested_queries = False
+
+        return _dedupe_strings(anchors)[:8]
+
     def _build_queries(self, topic: str, context: str = "") -> list[str]:
         topic = _compact_query_text(_clean_text(topic), max_chars=120)
+        anchors = self._extract_visual_search_anchors(context)
+        supplemental_web_queries = self._extract_supplemental_queries(
+            context,
+            "supplemental_web_queries",
+            limit=3,
+        )
         context = _compact_query_text(_clean_text(context), max_chars=220)
         base = " ".join(part for part in (topic, context) if part) or "meme"
 
@@ -69,9 +155,14 @@ class WebSearchAgent:
             f"{base} {_RESEARCH_QUERY_SUFFIXES[1]}",
             f"{base} {_RESEARCH_QUERY_SUFFIXES[2]}",
         ]
+        for anchor in anchors[:4]:
+            if topic:
+                queries.append(f"{topic} {anchor} meme background event")
+            queries.append(f"{anchor} meme context controversy")
+        queries.extend(supplemental_web_queries)
         return list(dict.fromkeys(query for query in queries if query.strip()))
 
-    def _build_news_queries(self, queries: list[str]) -> list[str]:
+    def _build_news_queries(self, queries: list[str], context: str = "") -> list[str]:
         bases: list[str] = []
         for query in queries:
             base = _clean_text(query)
@@ -84,11 +175,24 @@ class WebSearchAgent:
                 bases.append(base)
 
         base = bases[0] if bases else "meme"
-        news_queries = [
-            f"{base} meme news",
-            f"{base} meme controversy",
-            f"{base} social media reaction",
-        ]
+        anchors = self._extract_visual_search_anchors(base)
+        supplemental_news_queries = self._extract_supplemental_queries(
+            context,
+            "supplemental_news_queries",
+            limit=2,
+        )
+        news_queries: list[str] = []
+        for anchor in anchors[:4]:
+            news_queries.append(f"{anchor} news")
+            news_queries.append(f"{anchor} controversy")
+        news_queries.extend(supplemental_news_queries)
+        news_queries.extend(
+            [
+                f"{base} meme news",
+                f"{base} meme controversy",
+                f"{base} social media reaction",
+            ]
+        )
         return list(dict.fromkeys(query for query in news_queries if query.strip()))
 
     def _open_url(self, req: Request, data: bytes | None = None):
@@ -432,8 +536,17 @@ class WebSearchAgent:
             max_results=self.config.search_max_results * len(self._search_providers()),
         )
 
-    def _search_news_queries(self, queries: list[str]) -> list[dict[str, Any]]:
-        news_queries = self._build_news_queries(queries)[:2]
+    def _search_news_queries(
+        self,
+        query_input: list[str] | tuple[list[str], str],
+    ) -> list[dict[str, Any]]:
+        context = ""
+        if isinstance(query_input, tuple):
+            queries, context = query_input
+        else:
+            queries = query_input
+
+        news_queries = self._build_news_queries(queries, context=context)[:6]
         results: list[dict[str, Any]] = []
         errors: list[str] = []
 
@@ -505,7 +618,7 @@ class WebSearchAgent:
 
         news_results, news_error = self._run_with_timeout(
             self._search_news_queries,
-            queries,
+            (queries, context),
             "News search",
         )
         if news_error:
@@ -514,11 +627,12 @@ class WebSearchAgent:
         if text_results:
             web_lines = ["## Web Search Results"]
             for idx, item in enumerate(text_results, start=1):
+                source_id = f"W{idx}"
                 title = _clean_text(item.get("title"))
                 body = _clean_text(item.get("body"))
                 href = _clean_text(item.get("href") or item.get("url"))
                 web_lines.append(
-                    f"{idx}. {title}\n"
+                    f"[{source_id}] {title}\n"
                     f"   Snippet: {body or 'N/A'}\n"
                     f"   URL: {href or 'N/A'}"
                 )
@@ -527,13 +641,14 @@ class WebSearchAgent:
         if news_results:
             news_lines = ["## News Results"]
             for idx, item in enumerate(news_results, start=1):
+                source_id = f"N{idx}"
                 title = _clean_text(item.get("title"))
                 body = _clean_text(item.get("body"))
                 source = _clean_text(item.get("source"))
                 date = _clean_text(item.get("date"))
                 href = _clean_text(item.get("href") or item.get("url"))
                 news_lines.append(
-                    f"{idx}. {title}\n"
+                    f"[{source_id}] {title}\n"
                     f"   Source: {source or 'N/A'} | Date: {date or 'N/A'}\n"
                     f"   Snippet: {body or 'N/A'}\n"
                     f"   URL: {href or 'N/A'}"

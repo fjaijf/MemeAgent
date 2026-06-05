@@ -1,3 +1,16 @@
+Metadata-Version: 2.4
+Name: memeagent-cli
+Version: 0.1.0
+Summary: A local CLI research assistant for meme analysis, retrieval, and visual context.
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: langchain-core>=0.3.0
+Requires-Dist: langchain-openai>=0.2.0
+Requires-Dist: python-dotenv>=1.0.0
+Requires-Dist: ddgs>=8.0.0
+Requires-Dist: rich>=13.7.0
+Requires-Dist: openai>=1.0.0
+
 # MemeAgent
 
 `MemeAgent` is a minimal agent scaffold for meme studies and online discourse
@@ -86,14 +99,6 @@ To stream the final analysis as it is generated, add:
 
 ```bash
 python main.py --topic "PEPE" --search --stream
-```
-
-Streaming uses plain incremental text by default so Markdown does not jump or
-re-render while the model is still generating. If you prefer live Markdown
-rendering, add:
-
-```bash
-python main.py --topic "PEPE" --search --stream --stream-markdown
 ```
 
 MemeAgent supports three input modes:

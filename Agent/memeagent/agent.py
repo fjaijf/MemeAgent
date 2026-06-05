@@ -87,13 +87,19 @@ User-provided context:
 
 Look at the attached meme image(s) and produce a search-oriented visual description in Chinese.
 Focus on details that can help retrieve related background information before the final analysis.
+Pay special attention to searchable anchors: specific people, public figures, fictional characters,
+organizations, locations, flags, uniforms, buildings, events, disasters, protests, elections,
+platform UI, screenshots, watermarks, slogans, exact OCR text, and distinctive background scenes.
 
 Return these sections:
 1. OCR/text visible in the image: transcribe all visible text, preserving language and notable spelling.
-2. Visual description: describe people, characters, objects, layout, symbols, expressions, gestures, colors, and editing style.
-3. Meme template or cultural references: identify possible meme templates, named figures, events, slogans, fandoms, communities, or platform conventions.
-4. Harm/sentiment cues: list visible cues related to hostility, stereotyping, misinformation, persuasion, mobilization, irony, satire, fear, anger, ridicule, or ambiguity.
-5. Search keywords: provide 8-15 concise keywords or phrases in both Chinese and English when useful. Include exact OCR phrases, likely meme names, and visual entities.
+2. Searchable visual anchors: list identifiable people, characters, organizations, places, background settings, events, platforms, logos, symbols, and objects. Mark uncertain identities as uncertain.
+3. Event/background hypotheses: describe whether the image may refer to a specific news event, political moment, social incident, campaign, conflict, trend, or public controversy. Separate visual evidence from speculation.
+4. Visual description: describe layout, expressions, gestures, colors, edits, screenshots, and meme composition.
+5. Meme template or cultural references: identify possible meme templates, named figures, events, slogans, fandoms, communities, or platform conventions.
+6. Harm/sentiment cues: list visible cues related to hostility, stereotyping, misinformation, persuasion, mobilization, irony, satire, fear, anger, ridicule, or ambiguity.
+7. Search keywords: provide 8-20 concise keywords or phrases in both Chinese and English when useful. Put each high-value search phrase in double quotes. Include exact OCR phrases, likely meme names, named people, background/event terms, locations, organizations, and visual entities.
+8. Suggested retrieval queries: provide 5-8 short web/news queries. Include queries that combine the meme/topic with any specific person, background, event, or OCR phrase found in the image.
 
 Be descriptive rather than interpretive. If something is uncertain, mark it as uncertain.
 """.strip()
@@ -111,6 +117,56 @@ Be descriptive rather than interpretive. If something is uncertain, mark it as u
         response = self.llm.invoke(messages)
         return _normalize_content(getattr(response, "content", response))
 
+    def plan_retrieval(
+        self,
+        topic: str = "",
+        context: str = "",
+        visual_report: str = "",
+        input_mode: str = "text_only",
+    ) -> str:
+        user_prompt = f"""
+Topic hint: {topic or "None"}
+
+Input mode: {input_mode}
+
+User-provided context:
+{context or "None"}
+
+Image-derived visual report:
+{visual_report or "None"}
+
+Plan a small set of supplemental searches before meme analysis.
+This plan must NOT replace the visual/OCR anchor queries. It should only add a few useful searches
+when the topic, OCR, visual report, or user context clearly supports them.
+
+Rules:
+- Do not invent people, events, places, organizations, dates, or platforms not supported by the input.
+- Prefer exact OCR phrases, named people, specific events, meme templates, locations, screenshots, or platform clues.
+- Keep queries short. Avoid broad abstract phrases such as "meme harmfulness discourse analysis".
+- If there is no strong concrete anchor for a supplemental query, write "None".
+- News queries should be used only for concrete public figures, current/recent events, controversies, organizations, or incidents.
+
+Return exactly these sections:
+EVIDENCE_QUESTIONS:
+- 2-4 concise questions that retrieval should help answer.
+
+SUPPLEMENTAL_WEB_QUERIES:
+- 0-3 short queries. Use "None" if no useful query exists.
+
+SUPPLEMENTAL_NEWS_QUERIES:
+- 0-2 short news-friendly queries. Use "None" if no useful news query exists.
+
+QUERY_CAUTIONS:
+- 1-3 cautions about what should not be assumed without evidence.
+""".strip()
+
+        messages = [
+            SystemMessage(content=self.system_prompt),
+            HumanMessage(content=user_prompt),
+        ]
+        response = self.llm.invoke(messages)
+        return _normalize_content(getattr(response, "content", response))
+
     def run(
         self,
         topic: str,
@@ -118,10 +174,51 @@ Be descriptive rather than interpretive. If something is uncertain, mark it as u
         image_paths: list[str] | None = None,
         image_urls: list[str] | None = None,
     ) -> str:
+        messages = self._build_analysis_messages(
+            topic=topic,
+            context=context,
+            image_paths=image_paths,
+            image_urls=image_urls,
+        )
+
+        response = self.llm.invoke(messages)
+        return _normalize_content(getattr(response, "content", response))
+
+    def stream(
+        self,
+        topic: str,
+        context: str = "",
+        image_paths: list[str] | None = None,
+        image_urls: list[str] | None = None,
+    ):
+        messages = self._build_analysis_messages(
+            topic=topic,
+            context=context,
+            image_paths=image_paths,
+            image_urls=image_urls,
+        )
+
+        if not hasattr(self.llm, "stream"):
+            yield self.run(
+                topic=topic,
+                context=context,
+                image_paths=image_paths,
+                image_urls=image_urls,
+            )
+            return
+
+        yield from self.llm.stream(messages)
+
+    def _build_analysis_messages(
+        self,
+        topic: str,
+        context: str = "",
+        image_paths: list[str] | None = None,
+        image_urls: list[str] | None = None,
+    ) -> list[Any]:
         image_paths = image_paths or []
         image_urls = image_urls or []
         image_count = len(image_paths) + len(image_urls)
-
         image_instruction = ""
         if image_count:
             image_instruction = (
@@ -143,14 +240,56 @@ Extra context:
 Please produce a researcher-oriented meme analysis in Chinese unless the user asks otherwise.
 Do not frame the topic as crypto, finance, or market speculation unless the topic or evidence explicitly requires it.
 
+Evidence citation rules:
+- Cite evidence for every important claim using source tags.
+- Use [Image] for visible image/OCR evidence.
+- Use [User Context] for information provided directly by the user.
+- Use [W1], [W2], ... only for web search results with those exact IDs.
+- Use [N1], [N2], ... only for news results with those exact IDs.
+- Use [Inference] for reasoning that is not directly stated by a source.
+- Do not invent source IDs. If no source supports a claim, say it is an inference or uncertain.
+- Distinguish direct evidence from speculation.
+
 Required sections:
-1. Meme object and context: identify the meme, its symbols, references, and likely cultural setting.
-2. Sentiment analysis: describe dominant emotions, polarity, intensity, ambiguity, and possible audience split.
-3. Harmfulness analysis: assess risks such as harassment, hate, stereotyping, misinformation, manipulation, panic, self-harm encouragement, radicalization, or reputational damage. Give a low/medium/high risk level with reasons.
-4. Audience and reception prediction: infer likely target audiences, vulnerable groups, in-groups/out-groups, and likely interpretations.
-5. Intent recognition: infer whether the meme appears humorous, satirical, persuasive, mobilizing, deceptive, provocative, identity-signaling, commercial, or coordinated. Separate evidence from speculation.
-6. Evolution tracking: explain possible origin clues, variants, mutation paths, cross-platform spread, and how meaning may change over time.
-7. Evidence gaps and confidence: state what the search/image/context supports, what remains uncertain, and a confidence level.
+1. Meme object and context
+   - Claim:
+   - Evidence:
+   - Confidence:
+   - Uncertainty:
+2. Visual/OCR evidence
+   - Claim:
+   - Evidence:
+   - Confidence:
+   - Uncertainty:
+3. Sentiment analysis
+   - Claim:
+   - Evidence:
+   - Confidence:
+   - Uncertainty:
+4. Harmfulness analysis
+   - Claim:
+   - Evidence:
+   - Confidence:
+   - Uncertainty:
+5. Audience and reception prediction
+   - Claim:
+   - Evidence:
+   - Confidence:
+   - Uncertainty:
+6. Intent recognition
+   - Claim:
+   - Evidence:
+   - Confidence:
+   - Uncertainty:
+7. Evolution tracking
+   - Claim:
+   - Evidence:
+   - Confidence:
+   - Uncertainty:
+8. Evidence map
+   - Explain what [Image], [User Context], [W#], [N#], and [Inference] were used for.
+9. Evidence gaps and overall confidence
+   - State what remains unsupported, what should be searched next, and give an overall confidence level.
 """.strip()
 
 
@@ -165,6 +304,4 @@ Required sections:
             SystemMessage(content=self.system_prompt),
             HumanMessage(content=user_content),
         ]
-
-        response = self.llm.invoke(messages)
-        return _normalize_content(getattr(response, "content", response))
+        return messages

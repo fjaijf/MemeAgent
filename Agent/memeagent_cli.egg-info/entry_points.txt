@@ -1,0 +1,3 @@
+[console_scripts]
+meme = main:main
+memeagent = main:main

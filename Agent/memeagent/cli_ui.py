@@ -37,12 +37,15 @@ class RunSummary:
 class MemeAgentCLI:
     """Terminal presentation helpers with a plain-text fallback."""
 
-    def __init__(self, enabled: bool = True) -> None:
+    def __init__(self, enabled: bool = True, stream_markdown: bool = False) -> None:
         self.enabled = enabled and Console is not None
+        self.stream_markdown = stream_markdown and self.enabled
         self.console = Console() if self.enabled else None
         self._progress: Any = None
         self._live: Any = None
         self._task_id: Any = None
+        self._stream_live: Any = None
+        self._stream_text = ""
 
     def print_start(self, summary: RunSummary) -> None:
         if not self.enabled:
@@ -117,12 +120,60 @@ class MemeAgentCLI:
         self._progress = None
         self._task_id = None
 
+    def start_stream(self) -> None:
+        self._stream_text = ""
+        if self.stream_markdown:
+            self._stream_live = Live(
+                Panel(
+                    Markdown(""),
+                    title="Final Analysis",
+                    border_style="green",
+                ),
+                console=self.console,
+                refresh_per_second=4,
+            )
+            self._stream_live.start()
+            return
+
+        if self.enabled:
+            self.console.print(Rule("Final Analysis", style="green"))
+            return
+
+        print("\n=== Final Analysis ===")
+
+    def stream_delta(self, text: str) -> None:
+        self._stream_text += text
+        if not self.enabled:
+            print(text, end="", flush=True)
+            return
+
+        if self.stream_markdown and self._stream_live is not None:
+            self._stream_live.update(
+                Panel(
+                    Markdown(self._stream_text),
+                    title="Final Analysis",
+                    border_style="green",
+                )
+            )
+            return
+
+        self.console.print(text, end="", markup=False, highlight=False, soft_wrap=True)
+
+    def stop_stream(self) -> None:
+        if self._stream_live is not None:
+            self._stream_live.stop()
+            self._stream_live = None
+            return
+
+        print()
+
     def print_result(
         self,
         analysis: str,
         input_mode: str,
         search_report: str = "",
         visual_report: str = "",
+        retrieval_plan: str = "",
         show_search: bool = False,
     ) -> None:
         if not self.enabled:
@@ -131,10 +182,15 @@ class MemeAgentCLI:
                 if visual_report:
                     print("\n=== Image-Derived Search Context ===")
                     print(visual_report)
+                if retrieval_plan:
+                    print("\n=== Supplemental Retrieval Plan ===")
+                    print(retrieval_plan)
                 print("\n=== Search Report ===")
                 print(search_report)
-                print("\n=== Final Analysis ===")
-            print(analysis)
+                if analysis:
+                    print("\n=== Final Analysis ===")
+            if analysis:
+                print(analysis)
             return
 
         self.console.print(Rule(f"Input Mode: {input_mode}", style="cyan"))
@@ -147,6 +203,14 @@ class MemeAgentCLI:
                         border_style="blue",
                     )
                 )
+            if retrieval_plan:
+                self.console.print(
+                    Panel(
+                        Markdown(retrieval_plan),
+                        title="Supplemental Retrieval Plan",
+                        border_style="yellow",
+                    )
+                )
             self.console.print(
                 Panel(
                     Markdown(search_report),
@@ -155,13 +219,14 @@ class MemeAgentCLI:
                 )
             )
 
-        self.console.print(
-            Panel(
-                Markdown(analysis),
-                title="Final Analysis",
-                border_style="green",
+        if analysis:
+            self.console.print(
+                Panel(
+                    Markdown(analysis),
+                    title="Final Analysis",
+                    border_style="green",
+                )
             )
-        )
 
     def print_error(self, message: str) -> None:
         if self.enabled:

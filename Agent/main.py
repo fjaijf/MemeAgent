@@ -48,6 +48,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable rich terminal visuals and print plain text output.",
     )
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Stream the final analysis as it is generated.",
+    )
+    parser.add_argument(
+        "--stream-markdown",
+        action="store_true",
+        help="Render streamed analysis as a live Markdown panel. Plain streaming is steadier.",
+    )
     return parser.parse_args()
 
 
@@ -74,7 +84,7 @@ def main() -> None:
         )
     )
     workflow = MemeResearchWorkflow(meme_agent=agent, search_agent=search_agent)
-    ui = MemeAgentCLI(enabled=not args.plain)
+    ui = MemeAgentCLI(enabled=not args.plain, stream_markdown=args.stream_markdown)
 
     try:
         ui.print_start(
@@ -90,22 +100,69 @@ def main() -> None:
             )
         )
         ui.start_activity()
+        stream_started = False
+        search_shown = False
+
+        def handle_progress(stage: str, message: str) -> None:
+            nonlocal stream_started
+            ui.update(stage, message)
+            if args.stream and stage == "analysis" and not stream_started:
+                stream_started = True
+                ui.stop_activity()
+                ui.start_stream()
+
+        def handle_search_ready(
+            input_mode: str,
+            search_report: str,
+            visual_report: str,
+            retrieval_plan: str,
+        ) -> None:
+            nonlocal search_shown
+            if not (args.stream and args.search and args.show_search):
+                return
+            search_shown = True
+            ui.stop_activity()
+            ui.print_result(
+                analysis="",
+                input_mode=input_mode,
+                search_report=search_report,
+                visual_report=visual_report,
+                retrieval_plan=retrieval_plan,
+                show_search=True,
+            )
+
         result = workflow.run(
             topic=args.topic,
             context=args.context,
             image_paths=args.image,
             image_urls=args.image_url,
             use_search=args.search,
-            progress=ui.update,
+            progress=handle_progress if args.stream else ui.update,
+            stream_analysis=args.stream,
+            analysis_delta=ui.stream_delta if args.stream else None,
+            search_ready=handle_search_ready if args.stream else None,
         )
-        ui.stop_activity()
-        ui.print_result(
-            analysis=result.analysis,
-            input_mode=result.input_mode,
-            search_report=result.search_report,
-            visual_report=result.visual_report,
-            show_search=args.search and args.show_search,
-        )
+        if args.stream:
+            ui.stop_stream()
+            if args.search and args.show_search and not search_shown:
+                ui.print_result(
+                    analysis="",
+                    input_mode=result.input_mode,
+                    search_report=result.search_report,
+                    visual_report=result.visual_report,
+                    retrieval_plan=result.retrieval_plan,
+                    show_search=True,
+                )
+        else:
+            ui.stop_activity()
+            ui.print_result(
+                analysis=result.analysis,
+                input_mode=result.input_mode,
+                search_report=result.search_report,
+                visual_report=result.visual_report,
+                retrieval_plan=result.retrieval_plan,
+                show_search=args.search and args.show_search,
+            )
     except KeyboardInterrupt:
         ui.stop_activity()
         ui.print_error("\nInterrupted by user.")

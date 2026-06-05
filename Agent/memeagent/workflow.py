@@ -14,6 +14,7 @@ class WorkflowResult:
     analysis: str
     combined_context: str
     visual_report: str = ""
+    retrieval_plan: str = ""
     input_mode: str = "text_only"
 
 
@@ -75,7 +76,12 @@ class MemeResearchWorkflow:
 
         return " ".join(terms)
 
-    def _build_search_context(self, context: str, visual_report: str) -> str:
+    def _build_search_context(
+        self,
+        context: str,
+        visual_report: str,
+        retrieval_plan: str,
+    ) -> str:
         parts: list[str] = []
         if context.strip():
             parts.append(context.strip())
@@ -84,6 +90,9 @@ class MemeResearchWorkflow:
             search_terms = self._extract_search_terms(visual_report)
             if search_terms:
                 parts.append(search_terms)
+
+        if retrieval_plan.strip():
+            parts.append("Supplemental retrieval plan:\n" + retrieval_plan.strip())
 
         return "\n\n".join(parts)
 
@@ -95,11 +104,15 @@ class MemeResearchWorkflow:
         image_urls: list[str] | None = None,
         use_search: bool = True,
         progress: Callable[[str, str], None] | None = None,
+        stream_analysis: bool = False,
+        analysis_delta: Callable[[str], None] | None = None,
+        search_ready: Callable[[str, str, str, str], None] | None = None,
     ) -> WorkflowResult:
         image_paths = image_paths or []
         image_urls = image_urls or []
         search_report = ""
         visual_report = ""
+        retrieval_plan = ""
         combined_parts: list[str] = []
         input_mode = self._detect_input_mode(topic, context, image_paths, image_urls)
         has_images = input_mode in {"image_only", "text_and_image"}
@@ -131,21 +144,87 @@ class MemeResearchWorkflow:
                 )
 
         if use_search:
+            self._emit_progress(
+                progress,
+                "planning",
+                "Planning supplemental retrieval queries.",
+            )
+            try:
+                retrieval_plan = self.meme_agent.plan_retrieval(
+                    topic=topic,
+                    context=context,
+                    visual_report=visual_report,
+                    input_mode=input_mode,
+                )
+            except Exception as exc:
+                raise RuntimeError("Retrieval planning LLM call failed.") from exc
+            if retrieval_plan:
+                combined_parts.append("Supplemental retrieval plan:\n" + retrieval_plan)
+            self._emit_progress(progress, "planning", "Supplemental retrieval plan ready.")
             self._emit_progress(progress, "search", "Collecting web and news context.")
-            search_context = self._build_search_context(context, visual_report)
+            search_context = self._build_search_context(
+                context,
+                visual_report,
+                retrieval_plan,
+            )
             search_report = self.search_agent.run(topic=topic, context=search_context)
-            combined_parts.append("Internet search findings:\n" + search_report)
+            combined_parts.append(
+                "Internet search findings. Cite web sources as [W#] and news "
+                "sources as [N#] exactly as labeled below:\n"
+                + search_report
+            )
             self._emit_progress(progress, "search", "Retrieval finished.")
 
         combined_context = "\n\n".join(part for part in combined_parts if part).strip()
+        if search_ready:
+            search_ready(input_mode, search_report, visual_report, retrieval_plan)
         self._emit_progress(progress, "analysis", "Running final meme analysis.")
         try:
-            analysis = self.meme_agent.run(
-                topic=topic,
-                context=combined_context,
-                image_paths=image_paths,
-                image_urls=image_urls,
-            )
+            if stream_analysis:
+                chunks: list[str] = []
+                try:
+                    for chunk in self.meme_agent.stream(
+                        topic=topic,
+                        context=combined_context,
+                        image_paths=image_paths,
+                        image_urls=image_urls,
+                    ):
+                        chunks.append(chunk)
+                        if analysis_delta:
+                            analysis_delta(chunk)
+                except Exception as stream_exc:
+                    if not chunks:
+                        analysis = self.meme_agent.run(
+                            topic=topic,
+                            context=combined_context,
+                            image_paths=image_paths,
+                            image_urls=image_urls,
+                        )
+                    else:
+                        warning = (
+                            "\n\n[Stream Warning] The streaming connection closed "
+                            "before the final chunk arrived. The analysis above is "
+                            "the partial output received before interruption."
+                        )
+                        chunks.append(warning)
+                        if analysis_delta:
+                            analysis_delta(warning)
+                        analysis = "".join(chunks)
+                    logger_message = getattr(stream_exc, "args", [""])[0]
+                    self._emit_progress(
+                        progress,
+                        "analysis",
+                        f"Streaming ended early: {logger_message}",
+                    )
+                else:
+                    analysis = "".join(chunks)
+            else:
+                analysis = self.meme_agent.run(
+                    topic=topic,
+                    context=combined_context,
+                    image_paths=image_paths,
+                    image_urls=image_urls,
+                )
         except Exception as exc:
             raise RuntimeError("Final analysis LLM call failed.") from exc
         self._emit_progress(progress, "analysis", "Final analysis ready.")
@@ -154,5 +233,6 @@ class MemeResearchWorkflow:
             analysis=analysis,
             combined_context=combined_context,
             visual_report=visual_report,
+            retrieval_plan=retrieval_plan,
             input_mode=input_mode,
         )

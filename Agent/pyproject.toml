@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "memeagent-cli"
+version = "0.1.0"
+description = "A local CLI research assistant for meme analysis, retrieval, and visual context."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "langchain-core>=0.3.0",
+    "langchain-openai>=0.2.0",
+    "python-dotenv>=1.0.0",
+    "ddgs>=8.0.0",
+    "rich>=13.7.0",
+    "openai>=1.0.0",
+]
+
+[project.scripts]
+memeagent = "main:main"
+meme = "main:main"
+
+[tool.setuptools]
+py-modules = ["main"]
+packages = ["memeagent"]
