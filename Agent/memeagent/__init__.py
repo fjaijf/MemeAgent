@@ -1,4 +1,5 @@
 from .agent import MemeAgent
+from .cache import SearchResultCache
 from .config import MemeAgentConfig
 from .llm import create_llm
 from .search_agent import SearchAgentConfig, WebSearchAgent
@@ -9,6 +10,7 @@ __all__ = [
     "MemeAgentConfig",
     "MemeResearchWorkflow",
     "SearchAgentConfig",
+    "SearchResultCache",
     "WebSearchAgent",
     "WorkflowResult",
     "create_llm",

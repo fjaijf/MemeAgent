@@ -23,6 +23,10 @@ class MemeAgentConfig:
     search_country: str
     search_lang: str
     tavily_search_depth: str
+    cache_enabled: bool
+    cache_dir: str
+    search_cache_ttl_seconds: int
+    news_cache_ttl_seconds: int
     system_prompt: str
 
     @classmethod
@@ -31,6 +35,7 @@ class MemeAgentConfig:
         model = (os.getenv("MEMEAGENT_MODEL") or "gpt-4o-mini").strip()
         raw_max_tokens = (os.getenv("MEMEAGENT_MAX_TOKENS") or "0").strip()
         max_tokens_value = int(raw_max_tokens) if raw_max_tokens else 0
+        cache_enabled = os.getenv("MEMEAGENT_CACHE_ENABLED", "true").strip().lower()
         return cls(
             provider="openai",
             model=model,
@@ -58,6 +63,14 @@ class MemeAgentConfig:
             search_country=os.getenv("MEMEAGENT_SEARCH_COUNTRY", "us").strip(),
             search_lang=os.getenv("MEMEAGENT_SEARCH_LANG", "en").strip(),
             tavily_search_depth=os.getenv("MEMEAGENT_TAVILY_SEARCH_DEPTH", "basic").strip(),
+            cache_enabled=cache_enabled not in {"0", "false", "no", "off"},
+            cache_dir=os.getenv("MEMEAGENT_CACHE_DIR", ".memeagent_cache").strip(),
+            search_cache_ttl_seconds=int(
+                os.getenv("MEMEAGENT_SEARCH_CACHE_TTL_SECONDS", str(7 * 24 * 60 * 60))
+            ),
+            news_cache_ttl_seconds=int(
+                os.getenv("MEMEAGENT_NEWS_CACHE_TTL_SECONDS", str(6 * 60 * 60))
+            ),
             system_prompt=(
                 "You are MemeAgent, a research assistant for meme studies and "
                 "online discourse analysis. Analyze memes with attention to "

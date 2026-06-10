@@ -67,6 +67,10 @@ def main() -> None:
     args = parse_args()
 
     config = MemeAgentConfig.from_env()
+    cache_dir = Path(config.cache_dir).expanduser()
+    if not cache_dir.is_absolute():
+        cache_dir = project_root / cache_dir
+    search_cache_path = str(cache_dir / "search.sqlite3")
     llm = create_llm(config)
     agent = MemeAgent(llm=llm, system_prompt=config.system_prompt)
     search_agent = WebSearchAgent(
@@ -81,6 +85,10 @@ def main() -> None:
             search_country=config.search_country,
             search_lang=config.search_lang,
             tavily_search_depth=config.tavily_search_depth,
+            cache_enabled=config.cache_enabled,
+            search_cache_path=search_cache_path,
+            search_cache_ttl_seconds=config.search_cache_ttl_seconds,
+            news_cache_ttl_seconds=config.news_cache_ttl_seconds,
         )
     )
     workflow = MemeResearchWorkflow(meme_agent=agent, search_agent=search_agent)
