@@ -22,11 +22,15 @@ class MemeAgentConfig:
     search_timeout: float
     search_country: str
     search_lang: str
+    search_context_sites: str
     tavily_search_depth: str
     cache_enabled: bool
     cache_dir: str
     search_cache_ttl_seconds: int
     news_cache_ttl_seconds: int
+    memory_enabled: bool
+    memory_dir: str
+    memory_recall_limit: int
     system_prompt: str
 
     @classmethod
@@ -36,6 +40,7 @@ class MemeAgentConfig:
         raw_max_tokens = (os.getenv("MEMEAGENT_MAX_TOKENS") or "0").strip()
         max_tokens_value = int(raw_max_tokens) if raw_max_tokens else 0
         cache_enabled = os.getenv("MEMEAGENT_CACHE_ENABLED", "true").strip().lower()
+        memory_enabled = os.getenv("MEMEAGENT_MEMORY_ENABLED", "true").strip().lower()
         return cls(
             provider="openai",
             model=model,
@@ -62,6 +67,13 @@ class MemeAgentConfig:
             search_timeout=float(os.getenv("MEMEAGENT_SEARCH_TIMEOUT", "12")),
             search_country=os.getenv("MEMEAGENT_SEARCH_COUNTRY", "us").strip(),
             search_lang=os.getenv("MEMEAGENT_SEARCH_LANG", "en").strip(),
+            search_context_sites=os.getenv(
+                "MEMEAGENT_SEARCH_CONTEXT_SITES",
+                (
+                    "reddit.com,x.com,twitter.com,weibo.com,zhihu.com,"
+                    "tieba.baidu.com,bilibili.com,tiktok.com"
+                ),
+            ).strip(),
             tavily_search_depth=os.getenv("MEMEAGENT_TAVILY_SEARCH_DEPTH", "basic").strip(),
             cache_enabled=cache_enabled not in {"0", "false", "no", "off"},
             cache_dir=os.getenv("MEMEAGENT_CACHE_DIR", ".memeagent_cache").strip(),
@@ -71,6 +83,9 @@ class MemeAgentConfig:
             news_cache_ttl_seconds=int(
                 os.getenv("MEMEAGENT_NEWS_CACHE_TTL_SECONDS", str(6 * 60 * 60))
             ),
+            memory_enabled=memory_enabled not in {"0", "false", "no", "off"},
+            memory_dir=os.getenv("MEMEAGENT_MEMORY_DIR", ".memeagent_memory").strip(),
+            memory_recall_limit=int(os.getenv("MEMEAGENT_MEMORY_RECALL_LIMIT", "3")),
             system_prompt=(
                 "You are MemeAgent, a research assistant for meme studies and "
                 "online discourse analysis. Analyze memes with attention to "

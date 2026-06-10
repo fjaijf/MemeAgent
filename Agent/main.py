@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -8,7 +9,9 @@ from dotenv import load_dotenv
 from memeagent.agent import MemeAgent
 from memeagent.cli_ui import MemeAgentCLI, RunSummary
 from memeagent.config import MemeAgentConfig
+from memeagent.heads import HEADS
 from memeagent.llm import create_llm
+from memeagent.memory import MemeMemoryStore
 from memeagent.search_agent import SearchAgentConfig, WebSearchAgent
 from memeagent.workflow import MemeResearchWorkflow
 
@@ -44,6 +47,85 @@ def parse_args() -> argparse.Namespace:
         help="Print the search report before the final analysis result.",
     )
     parser.add_argument(
+        "--search-provider",
+        default=None,
+        help="Override search provider. Supported values include ddgs, brave, tavily, zhihu, or comma-separated combinations.",
+    )
+    parser.add_argument(
+        "--search-api-key",
+        default=None,
+        help="Override search API key for providers such as Brave or Tavily.",
+    )
+    parser.add_argument(
+        "--zhihu-api-key",
+        default=None,
+        help="Override Zhihu search API key.",
+    )
+    parser.add_argument(
+        "--search-proxy",
+        default=None,
+        help="Override search proxy URL, for example http://127.0.0.1:7890.",
+    )
+    parser.add_argument(
+        "--search-max-results",
+        type=int,
+        default=None,
+        help="Override maximum web results per provider.",
+    )
+    parser.add_argument(
+        "--news-max-results",
+        type=int,
+        default=None,
+        help="Override maximum news results.",
+    )
+    parser.add_argument(
+        "--search-timeout",
+        type=float,
+        default=None,
+        help="Override search timeout in seconds.",
+    )
+    parser.add_argument(
+        "--search-country",
+        default=None,
+        help="Override search country code, for example us or cn.",
+    )
+    parser.add_argument(
+        "--search-lang",
+        default=None,
+        help="Override search language, for example en or zh-cn.",
+    )
+    parser.add_argument(
+        "--search-context-sites",
+        default=None,
+        help=(
+            "Comma-separated sites for original-post/context queries, for example "
+            "reddit.com,x.com,weibo.com,zhihu.com."
+        ),
+    )
+    parser.add_argument(
+        "--tavily-search-depth",
+        choices=["basic", "advanced"],
+        default=None,
+        help="Override Tavily search depth.",
+    )
+    parser.add_argument(
+        "--no-search-cache",
+        action="store_true",
+        help="Disable search result cache for this run.",
+    )
+    parser.add_argument(
+        "--search-cache-ttl-seconds",
+        type=int,
+        default=None,
+        help="Override web search cache TTL in seconds.",
+    )
+    parser.add_argument(
+        "--news-cache-ttl-seconds",
+        type=int,
+        default=None,
+        help="Override news search cache TTL in seconds.",
+    )
+    parser.add_argument(
         "--plain",
         action="store_true",
         help="Disable rich terminal visuals and print plain text output.",
@@ -58,6 +140,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Render streamed analysis as a live Markdown panel. Plain streaming is steadier.",
     )
+    parser.add_argument(
+        "--task",
+        action="append",
+        default=[],
+        help=(
+            "Run one or more independent analysis heads instead of final synthesis. "
+            "Choices: harmfulness, sentiment, intent, evolution, audience, "
+            "evidence-audit, all. Can be passed multiple times or comma-separated."
+        ),
+    )
+    parser.add_argument(
+        "--list-tasks",
+        action="store_true",
+        help="List available multi-head task names and exit.",
+    )
     return parser.parse_args()
 
 
@@ -66,11 +163,57 @@ def main() -> None:
     load_dotenv(project_root / ".env")
     args = parse_args()
 
+    if args.list_tasks:
+        print("Available MemeAgent task heads:")
+        for name, head in HEADS.items():
+            print(f"- {name}: {head.description}")
+        print("- all: run every task head above")
+        return
+
     config = MemeAgentConfig.from_env()
+    search_overrides = {}
+    if args.search_provider is not None:
+        search_overrides["search_provider"] = args.search_provider.strip()
+    if args.search_api_key is not None:
+        search_overrides["search_api_key"] = args.search_api_key.strip() or None
+    if args.zhihu_api_key is not None:
+        search_overrides["zhihu_api_key"] = args.zhihu_api_key.strip() or None
+    if args.search_proxy is not None:
+        search_overrides["search_proxy"] = args.search_proxy.strip() or None
+    if args.search_max_results is not None:
+        search_overrides["search_max_results"] = args.search_max_results
+    if args.news_max_results is not None:
+        search_overrides["news_max_results"] = args.news_max_results
+    if args.search_timeout is not None:
+        search_overrides["search_timeout"] = args.search_timeout
+    if args.search_country is not None:
+        search_overrides["search_country"] = args.search_country.strip()
+    if args.search_lang is not None:
+        search_overrides["search_lang"] = args.search_lang.strip()
+    if args.search_context_sites is not None:
+        search_overrides["search_context_sites"] = args.search_context_sites.strip()
+    if args.tavily_search_depth is not None:
+        search_overrides["tavily_search_depth"] = args.tavily_search_depth
+    if args.no_search_cache:
+        search_overrides["cache_enabled"] = False
+    if args.search_cache_ttl_seconds is not None:
+        search_overrides["search_cache_ttl_seconds"] = args.search_cache_ttl_seconds
+    if args.news_cache_ttl_seconds is not None:
+        search_overrides["news_cache_ttl_seconds"] = args.news_cache_ttl_seconds
+    if search_overrides:
+        config = replace(config, **search_overrides)
     cache_dir = Path(config.cache_dir).expanduser()
     if not cache_dir.is_absolute():
         cache_dir = project_root / cache_dir
     search_cache_path = str(cache_dir / "search.sqlite3")
+    memory_dir = Path(config.memory_dir).expanduser()
+    if not memory_dir.is_absolute():
+        memory_dir = project_root / memory_dir
+    memory_store = (
+        MemeMemoryStore(memory_dir / "memory.sqlite3")
+        if config.memory_enabled
+        else None
+    )
     llm = create_llm(config)
     agent = MemeAgent(llm=llm, system_prompt=config.system_prompt)
     search_agent = WebSearchAgent(
@@ -84,6 +227,7 @@ def main() -> None:
             search_timeout=config.search_timeout,
             search_country=config.search_country,
             search_lang=config.search_lang,
+            search_context_sites=config.search_context_sites,
             tavily_search_depth=config.tavily_search_depth,
             cache_enabled=config.cache_enabled,
             search_cache_path=search_cache_path,
@@ -91,7 +235,12 @@ def main() -> None:
             news_cache_ttl_seconds=config.news_cache_ttl_seconds,
         )
     )
-    workflow = MemeResearchWorkflow(meme_agent=agent, search_agent=search_agent)
+    workflow = MemeResearchWorkflow(
+        meme_agent=agent,
+        search_agent=search_agent,
+        memory_store=memory_store,
+        memory_recall_limit=config.memory_recall_limit,
+    )
     ui = MemeAgentCLI(enabled=not args.plain, stream_markdown=args.stream_markdown)
 
     try:
@@ -138,6 +287,29 @@ def main() -> None:
                 retrieval_plan=retrieval_plan,
                 show_search=True,
             )
+
+        if args.task:
+            result = workflow.run_heads(
+                topic=args.topic,
+                context=args.context,
+                image_paths=args.image,
+                image_urls=args.image_url,
+                task_heads=args.task,
+                use_search=args.search,
+                progress=ui.update,
+                search_ready=handle_search_ready if args.search and args.show_search else None,
+            )
+            ui.stop_activity()
+            ui.print_result(
+                analysis=result.formatted_output,
+                input_mode=result.input_mode,
+                search_report=result.search_report,
+                visual_report=result.visual_report,
+                retrieval_plan=result.retrieval_plan,
+                show_search=args.search and args.show_search,
+                analysis_title="Task Heads",
+            )
+            return
 
         result = workflow.run(
             topic=args.topic,

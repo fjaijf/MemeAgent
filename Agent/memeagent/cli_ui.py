@@ -175,6 +175,7 @@ class MemeAgentCLI:
         visual_report: str = "",
         retrieval_plan: str = "",
         show_search: bool = False,
+        analysis_title: str = "Final Analysis",
     ) -> None:
         if not self.enabled:
             print(f"Input mode: {input_mode}")
@@ -188,7 +189,7 @@ class MemeAgentCLI:
                 print("\n=== Search Report ===")
                 print(search_report)
                 if analysis:
-                    print("\n=== Final Analysis ===")
+                    print(f"\n=== {analysis_title} ===")
             if analysis:
                 print(analysis)
             return
@@ -223,7 +224,7 @@ class MemeAgentCLI:
             self.console.print(
                 Panel(
                     Markdown(analysis),
-                    title="Final Analysis",
+                    title=analysis_title,
                     border_style="green",
                 )
             )

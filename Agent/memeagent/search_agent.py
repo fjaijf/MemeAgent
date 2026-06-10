@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import re
+from threading import Lock
 import time
 from typing import Any
 from urllib.parse import urlencode
@@ -25,6 +26,16 @@ _BRAVE_WEB_API = "https://api.search.brave.com/res/v1/web/search"
 _BRAVE_NEWS_API = "https://api.search.brave.com/res/v1/news/search"
 _TAVILY_SEARCH_API = "https://api.tavily.com/search"
 _ZHIHU_SEARCH_API = "https://developer.zhihu.com/api/v1/content/zhihu_search"
+_DEFAULT_CONTEXT_SITES = (
+    "reddit.com",
+    "x.com",
+    "twitter.com",
+    "weibo.com",
+    "zhihu.com",
+    "tieba.baidu.com",
+    "bilibili.com",
+    "tiktok.com",
+)
 
 _GENERIC_RELEVANCE_TERMS = {
     "and",
@@ -53,11 +64,18 @@ class SearchAgentConfig:
     search_timeout: float = 12.0
     search_country: str = "us"
     search_lang: str = "en"
+    search_context_sites: str = ",".join(_DEFAULT_CONTEXT_SITES)
     tavily_search_depth: str = "basic"
     cache_enabled: bool = True
     search_cache_path: str | None = None
     search_cache_ttl_seconds: int = 7 * 24 * 60 * 60
     news_cache_ttl_seconds: int = 6 * 60 * 60
+
+
+@dataclass(frozen=True)
+class PlannedSearchQuery:
+    query: str
+    category: str
 
 
 def _clean_text(value: Any) -> str:
@@ -113,6 +131,10 @@ def _is_useful_query(value: str) -> bool:
         return False
     if len(value) < 2:
         return False
+    if value.lower().startswith("site:"):
+        return len(value) <= 180
+    if value.startswith('"') and value.endswith('"'):
+        return len(value) <= 180
     words = re.findall(r"[A-Za-z0-9_]+", value)
     if len(words) > 12:
         return False
@@ -155,6 +177,37 @@ def _normalize_section_heading(value: str) -> str:
     return heading.rstrip(":\uff1a").strip().lower()
 
 
+def _quote_query(value: str) -> str:
+    value = _strip_query_noise(value).replace('"', " ")
+    value = _compact_query_text(value, max_chars=140)
+    return f'"{value}"' if value else ""
+
+
+def _is_site_query(value: str) -> bool:
+    return value.strip().lower().startswith("site:")
+
+
+def _url_host(value: str) -> str:
+    lowered = value.lower()
+    lowered = re.sub(r"^https?://", "", lowered)
+    lowered = lowered.split("/", 1)[0]
+    return lowered.removeprefix("www.")
+
+
+def _parse_context_sites(value: str) -> list[str]:
+    sites = []
+    seen = set()
+    for raw_site in value.split(","):
+        site = raw_site.strip().lower()
+        site = re.sub(r"^https?://", "", site).split("/", 1)[0]
+        site = site.removeprefix("www.")
+        if not site or site in seen:
+            continue
+        seen.add(site)
+        sites.append(site)
+    return sites
+
+
 class WebSearchAgent:
     """Small retrieval agent that gathers public web and news context."""
 
@@ -165,6 +218,36 @@ class WebSearchAgent:
             if config.cache_enabled and config.search_cache_path
             else None
         )
+        self._cache_stats_lock = Lock()
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self._cache_stores = 0
+
+    def _reset_cache_stats(self) -> None:
+        with self._cache_stats_lock:
+            self._cache_hits = 0
+            self._cache_misses = 0
+            self._cache_stores = 0
+
+    def _record_cache_stat(self, field: str) -> None:
+        with self._cache_stats_lock:
+            if field == "hit":
+                self._cache_hits += 1
+            elif field == "miss":
+                self._cache_misses += 1
+            elif field == "store":
+                self._cache_stores += 1
+
+    def _format_cache_stats(self) -> str:
+        if not self._cache:
+            return "Search cache: disabled"
+
+        with self._cache_stats_lock:
+            return (
+                "Search cache: enabled "
+                f"(hits={self._cache_hits}, misses={self._cache_misses}, "
+                f"stored={self._cache_stores})"
+            )
 
     def _extract_supplemental_queries(
         self,
@@ -233,7 +316,21 @@ class WebSearchAgent:
             terms.update(_query_terms(value))
         return terms
 
-    def _build_queries(self, topic: str, context: str = "") -> list[str]:
+    def _add_planned_query(
+        self,
+        plan: list[PlannedSearchQuery],
+        seen: set[str],
+        query: str,
+        category: str,
+    ) -> None:
+        query = _compact_query_text(query, max_chars=180)
+        key = query.lower()
+        if not _is_useful_query(query) or key in seen:
+            return
+        seen.add(key)
+        plan.append(PlannedSearchQuery(query=query, category=category))
+
+    def _build_query_plan(self, topic: str, context: str = "") -> list[PlannedSearchQuery]:
         topic = _strip_query_noise(_clean_text(topic))
         anchors = self._extract_visual_search_anchors(context)
         supplemental_web_queries = self._extract_supplemental_queries(
@@ -244,23 +341,46 @@ class WebSearchAgent:
         supplemental_web_queries = [
             _strip_query_noise(query) for query in supplemental_web_queries
         ]
+        context_sites = _parse_context_sites(self.config.search_context_sites)
 
-        queries: list[str] = []
+        plan: list[PlannedSearchQuery] = []
+        seen: set[str] = set()
         if _is_useful_query(topic):
-            queries.extend([topic, f"{topic} meme"])
+            self._add_planned_query(plan, seen, topic, "topic")
+            self._add_planned_query(plan, seen, f"{topic} meme", "topic")
 
         for anchor in anchors[:5]:
-            queries.append(anchor)
+            quoted_anchor = _quote_query(anchor)
+            if quoted_anchor:
+                self._add_planned_query(plan, seen, quoted_anchor, "exact_anchor")
+            self._add_planned_query(plan, seen, anchor, "anchor_context")
             if topic and not _contains_word(anchor, topic):
-                queries.append(f"{topic} {anchor}")
+                self._add_planned_query(plan, seen, f"{topic} {anchor}", "topic_anchor")
             if not _contains_word(anchor, "meme") and not _contains_word(anchor, "memes"):
-                queries.append(f"{anchor} meme")
+                self._add_planned_query(plan, seen, f"{anchor} meme", "meme_context")
 
-        queries.extend(supplemental_web_queries)
-        if not queries:
-            queries.append("meme")
+        for anchor in anchors[:3]:
+            quoted_anchor = _quote_query(anchor)
+            if not quoted_anchor:
+                continue
+            for site in context_sites[:8]:
+                self._add_planned_query(
+                    plan,
+                    seen,
+                    f"site:{site} {quoted_anchor}",
+                    "site_context",
+                )
 
-        return _dedupe_strings([query for query in queries if _is_useful_query(query)])[:10]
+        for query in supplemental_web_queries:
+            self._add_planned_query(plan, seen, query, "supplemental")
+
+        if not plan:
+            self._add_planned_query(plan, seen, "meme", "fallback")
+
+        return plan[:18]
+
+    def _build_queries(self, topic: str, context: str = "") -> list[str]:
+        return [item.query for item in self._build_query_plan(topic, context)]
 
     def _build_news_queries(self, queries: list[str], context: str = "") -> list[str]:
         anchors = self._extract_visual_search_anchors(context)
@@ -269,8 +389,10 @@ class WebSearchAgent:
             "supplemental_news_queries",
             limit=2,
         )
+        seed_queries = [query for query in queries if not _is_site_query(query)]
         news_queries: list[str] = []
-        for anchor in anchors[:4] or queries[:4]:
+        for anchor in anchors[:4] or seed_queries[:4]:
+            anchor = anchor.strip('"')
             news_queries.append(f"{anchor} news")
             news_queries.append(f"{anchor} controversy")
         news_queries.extend(supplemental_news_queries)
@@ -429,6 +551,7 @@ class WebSearchAgent:
         cache_key = self._build_cache_key(kind=kind, provider=provider, query=query)
         cached = self._cache.get(cache_key)
         if cached is not None:
+            self._record_cache_stat("hit")
             logger.debug(
                 "Search cache hit for kind=%s provider=%s query=%s",
                 kind,
@@ -437,6 +560,7 @@ class WebSearchAgent:
             )
             return cached.value
 
+        self._record_cache_stat("miss")
         results = search_fn()
         ttl_seconds = (
             self.config.news_cache_ttl_seconds
@@ -444,6 +568,7 @@ class WebSearchAgent:
             else self.config.search_cache_ttl_seconds
         )
         self._cache.set(cache_key, results, ttl_seconds=ttl_seconds)
+        self._record_cache_stat("store")
         logger.debug(
             "Search cache stored for kind=%s provider=%s query=%s",
             kind,
@@ -462,6 +587,7 @@ class WebSearchAgent:
             "news_max_results": self.config.news_max_results,
             "search_country": self.config.search_country,
             "search_lang": self.config.search_lang,
+            "search_context_sites": self.config.search_context_sites,
             "tavily_search_depth": self.config.tavily_search_depth,
         }
         raw_key = json.dumps(payload, ensure_ascii=False, sort_keys=True)
@@ -626,7 +752,18 @@ class WebSearchAgent:
         if not isinstance(payload, dict):
             return []
 
-        for key in ("data", "results", "items", "list", "contents"):
+        for key in (
+            "data",
+            "Data",
+            "results",
+            "Results",
+            "items",
+            "Items",
+            "list",
+            "List",
+            "contents",
+            "Contents",
+        ):
             value = payload.get(key)
             if isinstance(value, list):
                 return value
@@ -635,33 +772,66 @@ class WebSearchAgent:
                 if nested:
                     return nested
 
-        return [payload] if any(key in payload for key in ("title", "url", "content")) else []
+        content_keys = {
+            "title",
+            "Title",
+            "url",
+            "Url",
+            "content",
+            "Content",
+            "content_text",
+            "ContentText",
+        }
+        return [payload] if any(key in payload for key in content_keys) else []
 
     def _normalize_zhihu_item(self, item: dict[str, Any]) -> dict[str, Any]:
         title = _clean_text(
             item.get("title")
+            or item.get("Title")
             or item.get("question_title")
+            or item.get("QuestionTitle")
             or item.get("name")
+            or item.get("Name")
             or item.get("headline")
+            or item.get("Headline")
         )
         body = _clean_text(
             item.get("summary")
+            or item.get("Summary")
             or item.get("excerpt")
+            or item.get("Excerpt")
             or item.get("snippet")
+            or item.get("Snippet")
             or item.get("content")
+            or item.get("Content")
+            or item.get("content_text")
+            or item.get("ContentText")
             or item.get("description")
+            or item.get("Description")
         )
         href = _clean_text(
             item.get("url")
+            or item.get("Url")
             or item.get("link")
+            or item.get("Link")
             or item.get("target_url")
+            or item.get("TargetUrl")
             or item.get("web_url")
+            or item.get("WebUrl")
         )
         date = _clean_text(
             item.get("created_time")
+            or item.get("CreatedTime")
             or item.get("updated_time")
+            or item.get("UpdatedTime")
             or item.get("published_time")
+            or item.get("PublishedTime")
+            or item.get("edit_time")
+            or item.get("EditTime")
         )
+        author = _clean_text(item.get("author_name") or item.get("AuthorName"))
+        content_type = _clean_text(item.get("content_type") or item.get("ContentType"))
+        content_id = _clean_text(item.get("content_id") or item.get("ContentID"))
 
         if not body:
             body = _clean_text(json.dumps(item, ensure_ascii=False))[:500]
@@ -670,8 +840,10 @@ class WebSearchAgent:
             "title": title or "Zhihu result",
             "body": body,
             "href": href,
-            "source": "Zhihu",
+            "source": f"Zhihu / {author}" if author else "Zhihu",
             "date": date,
+            "content_type": content_type,
+            "content_id": content_id,
         }
 
     def _search_text_queries(
@@ -788,6 +960,46 @@ class WebSearchAgent:
                 score += 1
         return score
 
+    def _classify_result_type(self, item: dict[str, Any], news: bool = False) -> str:
+        if news:
+            return "news_background"
+
+        href = _clean_text(item.get("href") or item.get("url"))
+        title = _clean_text(item.get("title")).lower()
+        body = _clean_text(item.get("body")).lower()
+        host = _url_host(href)
+        haystack = f"{title}\n{body}\n{href.lower()}"
+
+        if "reddit.com" in host:
+            if "/comments/" in href.lower() or "/r/" in href.lower():
+                return "post_or_comment_context_candidate"
+            return "platform_context_candidate"
+        if "x.com" in host or "twitter.com" in host:
+            if "/status/" in href.lower():
+                return "social_post_candidate"
+            return "platform_context_candidate"
+        if "weibo.com" in host:
+            return "social_post_candidate"
+        if "tieba.baidu.com" in host:
+            return "discussion_thread_candidate"
+        if "zhihu.com" in host:
+            return "discussion_context_candidate"
+        if any(site in host for site in ("bilibili.com", "tiktok.com", "douyin.com")):
+            return "platform_context_candidate"
+        if "knowyourmeme.com" in host or "meme" in host and "wiki" in host:
+            return "meme_template_reference"
+        if any(term in haystack for term in ("origin", "template", "meme explained")):
+            return "meme_template_reference"
+        if any(term in haystack for term in ("comment", "thread", "discussion", "reply")):
+            return "comment_context_candidate"
+        return "background_or_related_result"
+
+    def _format_query_plan(self, query_plan: list[PlannedSearchQuery]) -> str:
+        lines = ["Search query plan:"]
+        for item in query_plan:
+            lines.append(f"- [{item.category}] {item.query}")
+        return "\n".join(lines)
+
     def _run_with_timeout(
         self,
         fn,
@@ -806,12 +1018,14 @@ class WebSearchAgent:
                 return [], f"{label} failed: {exc}"
 
     def run(self, topic: str, context: str = "") -> str:
-        queries = self._build_queries(topic, context)
+        self._reset_cache_stats()
+        query_plan = self._build_query_plan(topic, context)
+        queries = [item.query for item in query_plan]
         relevance_terms = self._build_relevance_terms(topic, context, queries)
 
         sections: list[str] = [
             f"Search provider: {self.config.search_provider}",
-            "Search queries:\n" + "\n".join(f"- {query}" for query in queries),
+            self._format_query_plan(query_plan),
         ]
 
         text_results, text_error = self._run_with_timeout(
@@ -830,6 +1044,8 @@ class WebSearchAgent:
         if news_error:
             sections.append(news_error)
 
+        sections.insert(1, self._format_cache_stats())
+
         if text_results:
             web_lines = ["## Web Search Results"]
             for idx, item in enumerate(text_results, start=1):
@@ -837,8 +1053,10 @@ class WebSearchAgent:
                 title = _clean_text(item.get("title"))
                 body = _clean_text(item.get("body"))
                 href = _clean_text(item.get("href") or item.get("url"))
+                result_type = self._classify_result_type(item)
                 web_lines.append(
                     f"[{source_id}] {title}\n"
+                    f"   Candidate type: {result_type}\n"
                     f"   Snippet: {body or 'N/A'}\n"
                     f"   URL: {href or 'N/A'}"
                 )
@@ -853,8 +1071,10 @@ class WebSearchAgent:
                 source = _clean_text(item.get("source"))
                 date = _clean_text(item.get("date"))
                 href = _clean_text(item.get("href") or item.get("url"))
+                result_type = self._classify_result_type(item, news=True)
                 news_lines.append(
                     f"[{source_id}] {title}\n"
+                    f"   Candidate type: {result_type}\n"
                     f"   Source: {source or 'N/A'} | Date: {date or 'N/A'}\n"
                     f"   Snippet: {body or 'N/A'}\n"
                     f"   URL: {href or 'N/A'}"
