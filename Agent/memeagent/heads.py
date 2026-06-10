@@ -48,6 +48,7 @@ Return Chinese output with exactly these sections:
 5. Uncertainty and missing evidence
 
 Use source tags strictly: [Image], [User Context], [W#], [N#], [Inference].
+If iterative retrieval is used, cite round-specific labels exactly as shown, such as [R2-W1] or [R2-N1].
 Do not invent source IDs.
 """.strip(),
     ),
@@ -78,6 +79,7 @@ Return Chinese output with exactly these sections:
 5. Uncertainty and missing evidence
 
 Use source tags strictly: [Image], [User Context], [W#], [N#], [Inference].
+If iterative retrieval is used, cite round-specific labels exactly as shown, such as [R2-W1] or [R2-N1].
 Do not invent source IDs.
 """.strip(),
     ),
@@ -105,6 +107,7 @@ Return Chinese output with exactly these sections:
 5. Uncertainty and missing evidence
 
 Use source tags strictly: [Image], [User Context], [W#], [N#], [Inference].
+If iterative retrieval is used, cite round-specific labels exactly as shown, such as [R2-W1] or [R2-N1].
 Do not invent source IDs.
 """.strip(),
     ),
@@ -136,6 +139,7 @@ Return Chinese output with exactly these sections:
 5. Uncertainty and next retrieval targets
 
 Use source tags strictly: [Image], [User Context], [W#], [N#], [Inference].
+If iterative retrieval is used, cite round-specific labels exactly as shown, such as [R2-W1] or [R2-N1].
 Do not invent source IDs.
 """.strip(),
     ),
@@ -164,6 +168,7 @@ Return Chinese output with exactly these sections:
 5. Uncertainty and missing evidence
 
 Use source tags strictly: [Image], [User Context], [W#], [N#], [Inference].
+If iterative retrieval is used, cite round-specific labels exactly as shown, such as [R2-W1] or [R2-N1].
 Do not invent source IDs.
 """.strip(),
     ),
@@ -187,6 +192,7 @@ Return Chinese output with exactly these sections:
    - confidence: high, medium, low
 
 Use source tags strictly: [Image], [User Context], [W#], [N#], [Inference].
+If iterative retrieval is used, cite round-specific labels exactly as shown, such as [R2-W1] or [R2-N1].
 Do not invent source IDs.
 """.strip(),
     ),

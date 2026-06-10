@@ -167,6 +167,87 @@ QUERY_CAUTIONS:
         response = self.llm.invoke(messages)
         return _normalize_content(getattr(response, "content", response))
 
+    def reflect_retrieval(
+        self,
+        topic: str = "",
+        context: str = "",
+        visual_report: str = "",
+        retrieval_plan: str = "",
+        search_report: str = "",
+        input_mode: str = "text_only",
+        round_index: int = 1,
+        max_rounds: int = 3,
+    ) -> str:
+        user_prompt = f"""
+Topic hint: {topic or "None"}
+
+Input mode: {input_mode}
+
+Current retrieval round: {round_index} of {max_rounds}
+
+User-provided context:
+{context or "None"}
+
+Image-derived visual report:
+{visual_report or "None"}
+
+Initial retrieval plan:
+{retrieval_plan or "None"}
+
+Current cumulative search report:
+{search_report or "None"}
+
+You are the retrieval reflection planner for MemeAgent.
+Your task is NOT to analyze harmfulness. Your task is only to decide whether more retrieval is needed,
+identify evidence gaps, and propose the next small set of concrete searches.
+
+Evaluate whether the current results are enough to support later meme analysis, especially:
+- original post or repost candidates
+- comment, reply, thread, or discussion context
+- platform context
+- exact OCR/text matches
+- meme template, origin, or variant evidence
+- event/news/background evidence
+- harmfulness-relevant context such as target, audience, intent, and reception
+
+Rules:
+- Do not invent unsupported people, platforms, events, usernames, dates, or URLs.
+- Prefer exact OCR phrases, usernames, watermarks, visible platform clues, source URLs, named events, and candidate result titles.
+- Use site-specific queries when the current results suggest a platform, such as site:zhihu.com, site:reddit.com, site:x.com, site:weibo.com.
+- Keep queries short and concrete.
+- Continue only if the next searches are likely to add useful evidence.
+- Stop if the current evidence is already sufficient, if results are irrelevant, or if only broad generic searches remain.
+
+Return exactly these sections:
+RETRIEVAL_SCORE:
+- Integer 0-10, where 10 means strong context for analysis.
+
+SHOULD_CONTINUE:
+- yes or no
+
+STOP_REASON:
+- One concise sentence.
+
+EVIDENCE_GAPS:
+- 1-5 bullets. Use "None" if there are no important gaps.
+
+SUPPLEMENTAL_WEB_QUERIES:
+- 0-5 short queries for the next round. Use "None" if no useful query exists.
+
+SUPPLEMENTAL_NEWS_QUERIES:
+- 0-2 short news-friendly queries. Use "None" if no useful query exists.
+
+QUERY_CAUTIONS:
+- 1-3 cautions about what should not be assumed without evidence.
+""".strip()
+
+        messages = [
+            SystemMessage(content=self.system_prompt),
+            HumanMessage(content=user_prompt),
+        ]
+        response = self.llm.invoke(messages)
+        return _normalize_content(getattr(response, "content", response))
+
     def run(
         self,
         topic: str,
@@ -246,6 +327,7 @@ Evidence citation rules:
 - Use [User Context] for information provided directly by the user.
 - Use [W1], [W2], ... only for web search results with those exact IDs.
 - Use [N1], [N2], ... only for news results with those exact IDs.
+- If iterative retrieval is used, cite round-specific search labels exactly as shown, such as [R2-W1] or [R2-N1].
 - Use [Inference] for reasoning that is not directly stated by a source.
 - Do not invent source IDs. If no source supports a claim, say it is an inference or uncertain.
 - Distinguish direct evidence from speculation.

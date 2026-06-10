@@ -124,6 +124,123 @@ class MemeResearchWorkflow:
 
         return "\n\n".join(parts)
 
+    def _reflection_should_continue(self, reflection: str) -> bool:
+        match = re.search(
+            r"SHOULD_CONTINUE\s*:\s*(?:[-*]\s*)?(yes|no)\b",
+            reflection,
+            flags=re.I,
+        )
+        if match:
+            return match.group(1).lower() == "yes"
+        return False
+
+    def _reflection_has_queries(self, reflection: str) -> bool:
+        return bool(
+            re.search(
+                r"SUPPLEMENTAL_(?:WEB|NEWS)_QUERIES\s*:\s*\n\s*[-*]\s+(?!None\b|无\b|没有\b)",
+                reflection,
+                flags=re.I,
+            )
+        )
+
+    def _label_search_report(self, search_report: str, round_index: int) -> str:
+        if round_index <= 1:
+            return search_report
+
+        def replace_label(match: re.Match[str]) -> str:
+            return f"[R{round_index}-{match.group(1)}{match.group(2)}]"
+
+        return re.sub(r"\[(W|N)(\d+)\]", replace_label, search_report)
+
+    def _run_search_with_reflection(
+        self,
+        topic: str,
+        context: str,
+        visual_report: str,
+        retrieval_plan: str,
+        input_mode: str,
+        iterative_search: bool,
+        search_max_rounds: int,
+        progress: Callable[[str, str], None] | None,
+    ) -> str:
+        search_context = self._build_search_context(
+            context,
+            visual_report,
+            retrieval_plan,
+        )
+        self._emit_progress(progress, "search", "Collecting web and news context.")
+        first_report = self._label_search_report(
+            self.search_agent.run(topic=topic, context=search_context),
+            round_index=1,
+        )
+        if not iterative_search or search_max_rounds <= 1:
+            self._emit_progress(progress, "search", "Retrieval finished.")
+            return first_report
+
+        round_blocks = [f"## Retrieval Round 1\n\n{first_report}"]
+        cumulative_report = "\n\n".join(round_blocks)
+        base_context = search_context
+        max_rounds = max(1, search_max_rounds)
+
+        for next_round in range(2, max_rounds + 1):
+            reflection_round = next_round - 1
+            self._emit_progress(
+                progress,
+                "reflection",
+                f"Reflecting on retrieval round {reflection_round}.",
+            )
+            try:
+                reflection = self.meme_agent.reflect_retrieval(
+                    topic=topic,
+                    context=context,
+                    visual_report=visual_report,
+                    retrieval_plan=retrieval_plan,
+                    search_report=cumulative_report,
+                    input_mode=input_mode,
+                    round_index=reflection_round,
+                    max_rounds=max_rounds,
+                )
+            except Exception as exc:
+                raise RuntimeError("Retrieval reflection LLM call failed.") from exc
+
+            round_blocks.append(
+                f"## Retrieval Reflection after Round {reflection_round}\n\n{reflection}"
+            )
+            cumulative_report = "\n\n".join(round_blocks)
+            if not self._reflection_should_continue(reflection):
+                self._emit_progress(
+                    progress,
+                    "reflection",
+                    "Retrieval reflection decided to stop.",
+                )
+                break
+            if not self._reflection_has_queries(reflection):
+                self._emit_progress(
+                    progress,
+                    "reflection",
+                    "Retrieval reflection found no concrete follow-up queries.",
+                )
+                break
+
+            self._emit_progress(
+                progress,
+                "search",
+                f"Collecting retrieval round {next_round}.",
+            )
+            followup_context = (
+                f"{base_context}\n\n"
+                f"Retrieval reflection for round {next_round}:\n{reflection}"
+            )
+            next_report = self._label_search_report(
+                self.search_agent.run(topic=topic, context=followup_context),
+                round_index=next_round,
+            )
+            round_blocks.append(f"## Retrieval Round {next_round}\n\n{next_report}")
+            cumulative_report = "\n\n".join(round_blocks)
+
+        self._emit_progress(progress, "search", "Iterative retrieval finished.")
+        return cumulative_report
+
     def run(
         self,
         topic: str,
@@ -135,6 +252,8 @@ class MemeResearchWorkflow:
         stream_analysis: bool = False,
         analysis_delta: Callable[[str], None] | None = None,
         search_ready: Callable[[str, str, str, str], None] | None = None,
+        iterative_search: bool = False,
+        search_max_rounds: int = 3,
     ) -> WorkflowResult:
         image_paths = image_paths or []
         image_urls = image_urls or []
@@ -209,19 +328,22 @@ class MemeResearchWorkflow:
             if retrieval_plan:
                 combined_parts.append("Supplemental retrieval plan:\n" + retrieval_plan)
             self._emit_progress(progress, "planning", "Supplemental retrieval plan ready.")
-            self._emit_progress(progress, "search", "Collecting web and news context.")
-            search_context = self._build_search_context(
-                context,
-                visual_report,
-                retrieval_plan,
+            search_report = self._run_search_with_reflection(
+                topic=topic,
+                context=context,
+                visual_report=visual_report,
+                retrieval_plan=retrieval_plan,
+                input_mode=input_mode,
+                iterative_search=iterative_search,
+                search_max_rounds=search_max_rounds,
+                progress=progress,
             )
-            search_report = self.search_agent.run(topic=topic, context=search_context)
             combined_parts.append(
-                "Internet search findings. Cite web sources as [W#] and news "
-                "sources as [N#] exactly as labeled below:\n"
+                "Internet search findings. Cite source labels exactly as shown below. "
+                "Single-round labels look like [W1] or [N1]; iterative retrieval may "
+                "also include labels such as [R2-W1] or [R2-N1]:\n"
                 + search_report
             )
-            self._emit_progress(progress, "search", "Retrieval finished.")
 
         combined_context = "\n\n".join(part for part in combined_parts if part).strip()
         if search_ready:
@@ -309,6 +431,8 @@ class MemeResearchWorkflow:
         use_search: bool = True,
         progress: Callable[[str, str], None] | None = None,
         search_ready: Callable[[str, str, str, str], None] | None = None,
+        iterative_search: bool = False,
+        search_max_rounds: int = 3,
     ) -> MultiHeadWorkflowResult:
         image_paths = image_paths or []
         image_urls = image_urls or []
@@ -384,19 +508,22 @@ class MemeResearchWorkflow:
             if retrieval_plan:
                 combined_parts.append("Supplemental retrieval plan:\n" + retrieval_plan)
             self._emit_progress(progress, "planning", "Supplemental retrieval plan ready.")
-            self._emit_progress(progress, "search", "Collecting web and news context.")
-            search_context = self._build_search_context(
-                context,
-                visual_report,
-                retrieval_plan,
+            search_report = self._run_search_with_reflection(
+                topic=topic,
+                context=context,
+                visual_report=visual_report,
+                retrieval_plan=retrieval_plan,
+                input_mode=input_mode,
+                iterative_search=iterative_search,
+                search_max_rounds=search_max_rounds,
+                progress=progress,
             )
-            search_report = self.search_agent.run(topic=topic, context=search_context)
             combined_parts.append(
-                "Internet search findings. Cite web sources as [W#] and news "
-                "sources as [N#] exactly as labeled below:\n"
+                "Internet search findings. Cite source labels exactly as shown below. "
+                "Single-round labels look like [W1] or [N1]; iterative retrieval may "
+                "also include labels such as [R2-W1] or [R2-N1]:\n"
                 + search_report
             )
-            self._emit_progress(progress, "search", "Retrieval finished.")
 
         combined_context = "\n\n".join(part for part in combined_parts if part).strip()
         if search_ready:

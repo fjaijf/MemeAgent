@@ -47,6 +47,17 @@ def parse_args() -> argparse.Namespace:
         help="Print the search report before the final analysis result.",
     )
     parser.add_argument(
+        "--iterative-search",
+        action="store_true",
+        help="Use LLM reflection to run multiple retrieval rounds before analysis.",
+    )
+    parser.add_argument(
+        "--search-max-rounds",
+        type=int,
+        default=3,
+        help="Maximum retrieval rounds when --iterative-search is enabled.",
+    )
+    parser.add_argument(
         "--search-provider",
         default=None,
         help="Override search provider. Supported values include ddgs, brave, tavily, zhihu, or comma-separated combinations.",
@@ -298,6 +309,8 @@ def main() -> None:
                 use_search=args.search,
                 progress=ui.update,
                 search_ready=handle_search_ready if args.search and args.show_search else None,
+                iterative_search=args.iterative_search,
+                search_max_rounds=args.search_max_rounds,
             )
             ui.stop_activity()
             ui.print_result(
@@ -321,6 +334,8 @@ def main() -> None:
             stream_analysis=args.stream,
             analysis_delta=ui.stream_delta if args.stream else None,
             search_ready=handle_search_ready if args.stream else None,
+            iterative_search=args.iterative_search,
+            search_max_rounds=args.search_max_rounds,
         )
         if args.stream:
             ui.stop_stream()
