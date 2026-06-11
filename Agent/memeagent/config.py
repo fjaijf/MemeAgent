@@ -17,6 +17,10 @@ class MemeAgentConfig:
     search_api_key: str | None
     zhihu_api_key: str | None
     search_proxy: str | None
+    searxng_url: str
+    searxng_engines: str | None
+    searxng_web_categories: str
+    searxng_news_categories: str
     search_max_results: int
     news_max_results: int
     search_timeout: float
@@ -62,6 +66,24 @@ class MemeAgentConfig:
                 os.getenv("MEMEAGENT_SEARCH_PROXY", "").strip().strip('"').strip("'")
                 or None
             ),
+            searxng_url=(
+                os.getenv("MEMEAGENT_SEARXNG_URL", "http://localhost:8888")
+                .strip()
+                .strip('"')
+                .strip("'")
+            ),
+            searxng_engines=(
+                os.getenv("MEMEAGENT_SEARXNG_ENGINES", "").strip().strip('"').strip("'")
+                or None
+            ),
+            searxng_web_categories=os.getenv(
+                "MEMEAGENT_SEARXNG_WEB_CATEGORIES",
+                "general",
+            ).strip(),
+            searxng_news_categories=os.getenv(
+                "MEMEAGENT_SEARXNG_NEWS_CATEGORIES",
+                "news",
+            ).strip(),
             search_max_results=int(os.getenv("MEMEAGENT_SEARCH_MAX_RESULTS", "5")),
             news_max_results=int(os.getenv("MEMEAGENT_NEWS_MAX_RESULTS", "5")),
             search_timeout=float(os.getenv("MEMEAGENT_SEARCH_TIMEOUT", "12")),

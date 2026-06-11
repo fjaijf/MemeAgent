@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--search-provider",
         default=None,
-        help="Override search provider. Supported values include ddgs, brave, tavily, zhihu, or comma-separated combinations.",
+        help="Override search provider. Supported values include ddgs, google, searxng, brave, tavily, zhihu, or comma-separated combinations.",
     )
     parser.add_argument(
         "--search-api-key",
@@ -76,6 +76,26 @@ def parse_args() -> argparse.Namespace:
         "--zhihu-api-key",
         default=None,
         help="Override Zhihu search API key.",
+    )
+    parser.add_argument(
+        "--searxng-url",
+        default=None,
+        help="Override SearXNG base URL, for example http://localhost:8888.",
+    )
+    parser.add_argument(
+        "--searxng-engines",
+        default=None,
+        help="Override comma-separated SearXNG engines, for example google,bing.",
+    )
+    parser.add_argument(
+        "--searxng-web-categories",
+        default=None,
+        help="Override SearXNG web search categories. Default: general.",
+    )
+    parser.add_argument(
+        "--searxng-news-categories",
+        default=None,
+        help="Override SearXNG news search categories. Default: news.",
     )
     parser.add_argument(
         "--search-proxy",
@@ -195,6 +215,14 @@ def main() -> None:
         search_overrides["search_api_key"] = args.search_api_key.strip() or None
     if args.zhihu_api_key is not None:
         search_overrides["zhihu_api_key"] = args.zhihu_api_key.strip() or None
+    if args.searxng_url is not None:
+        search_overrides["searxng_url"] = args.searxng_url.strip()
+    if args.searxng_engines is not None:
+        search_overrides["searxng_engines"] = args.searxng_engines.strip() or None
+    if args.searxng_web_categories is not None:
+        search_overrides["searxng_web_categories"] = args.searxng_web_categories.strip()
+    if args.searxng_news_categories is not None:
+        search_overrides["searxng_news_categories"] = args.searxng_news_categories.strip()
     if args.search_proxy is not None:
         search_overrides["search_proxy"] = args.search_proxy.strip() or None
     if args.search_max_results is not None:
@@ -239,6 +267,10 @@ def main() -> None:
             search_api_key=config.search_api_key,
             zhihu_api_key=config.zhihu_api_key,
             search_proxy=config.search_proxy,
+            searxng_url=config.searxng_url,
+            searxng_engines=config.searxng_engines,
+            searxng_web_categories=config.searxng_web_categories,
+            searxng_news_categories=config.searxng_news_categories,
             search_max_results=config.search_max_results,
             news_max_results=config.news_max_results,
             search_timeout=config.search_timeout,

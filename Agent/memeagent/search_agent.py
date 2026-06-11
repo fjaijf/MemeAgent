@@ -9,6 +9,7 @@ import re
 from threading import Lock
 import time
 from typing import Any
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
@@ -16,6 +17,11 @@ try:
     from ddgs import DDGS
 except ImportError:
     from duckduckgo_search import DDGS
+
+try:
+    from googlesearch import search as google_search
+except ImportError:
+    google_search = None
 
 from .cache import SearchResultCache
 
@@ -26,6 +32,7 @@ _BRAVE_WEB_API = "https://api.search.brave.com/res/v1/web/search"
 _BRAVE_NEWS_API = "https://api.search.brave.com/res/v1/news/search"
 _TAVILY_SEARCH_API = "https://api.tavily.com/search"
 _ZHIHU_SEARCH_API = "https://developer.zhihu.com/api/v1/content/zhihu_search"
+_SEARXNG_DEFAULT_URL = "http://localhost:8888"
 _DEFAULT_CONTEXT_SITES = (
     "reddit.com",
     "x.com",
@@ -59,6 +66,10 @@ class SearchAgentConfig:
     search_api_key: str | None = None
     zhihu_api_key: str | None = None
     search_proxy: str | None = None
+    searxng_url: str = _SEARXNG_DEFAULT_URL
+    searxng_engines: str | None = None
+    searxng_web_categories: str = "general"
+    searxng_news_categories: str = "news"
     search_max_results: int = 5
     news_max_results: int = 5
     search_timeout: float = 12.0
@@ -459,6 +470,14 @@ class WebSearchAgent:
     ) -> list[dict[str, Any]]:
         if provider == "ddgs":
             return self._search_ddgs_text(query)
+        if provider == "google":
+            return self._search_google_text(query)
+        if provider == "searxng":
+            return self._search_searxng(
+                query,
+                max_results=self.config.search_max_results,
+                categories=self.config.searxng_web_categories,
+            )
         if provider == "brave":
             return self._search_brave(
                 query,
@@ -477,7 +496,7 @@ class WebSearchAgent:
             )
         raise ValueError(
             f"Unsupported search provider '{provider}'. "
-            "Use ddgs, brave, tavily, or zhihu."
+            "Use ddgs, google, searxng, brave, tavily, or zhihu."
         )
 
     def _search_news(self, query: str) -> list[dict[str, Any]]:
@@ -519,6 +538,14 @@ class WebSearchAgent:
     ) -> list[dict[str, Any]]:
         if provider == "ddgs":
             return self._search_ddgs_news(query)
+        if provider == "google":
+            return []
+        if provider == "searxng":
+            return self._search_searxng(
+                query,
+                max_results=self.config.news_max_results,
+                categories=self.config.searxng_news_categories,
+            )
         if provider == "brave":
             return self._search_brave(
                 query,
@@ -535,7 +562,7 @@ class WebSearchAgent:
             return []
         raise ValueError(
             f"Unsupported search provider '{provider}'. "
-            "Use ddgs, brave, tavily, or zhihu."
+            "Use ddgs, google, searxng, brave, tavily, or zhihu."
         )
 
     def _cached_provider_search(
@@ -589,6 +616,10 @@ class WebSearchAgent:
             "search_lang": self.config.search_lang,
             "search_context_sites": self.config.search_context_sites,
             "tavily_search_depth": self.config.tavily_search_depth,
+            "searxng_url": self.config.searxng_url,
+            "searxng_engines": self.config.searxng_engines,
+            "searxng_web_categories": self.config.searxng_web_categories,
+            "searxng_news_categories": self.config.searxng_news_categories,
         }
         raw_key = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
@@ -600,6 +631,183 @@ class WebSearchAgent:
     def _search_ddgs_news(self, query: str) -> list[dict[str, Any]]:
         with self._open_ddgs() as ddgs:
             return list(ddgs.news(query, max_results=self.config.news_max_results))
+
+    def _search_searxng(
+        self,
+        query: str,
+        max_results: int,
+        categories: str,
+    ) -> list[dict[str, Any]]:
+        endpoint = self._searxng_endpoint()
+        params: dict[str, str] = {
+            "q": query,
+            "format": "json",
+            "language": self.config.search_lang,
+            "safesearch": "0",
+        }
+        categories = _clean_text(categories)
+        if categories:
+            params["categories"] = categories
+        engines = _clean_text(self.config.searxng_engines)
+        if engines:
+            params["engines"] = engines
+
+        req = Request(
+            f"{endpoint}?{urlencode(params)}",
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "MemeAgent/0.1",
+            },
+        )
+        try:
+            with self._open_url(req) as resp:
+                payload = json.loads(resp.read())
+        except HTTPError as exc:
+            if exc.code == 403:
+                raise ValueError(
+                    "SearXNG returned 403. Enable JSON output in the instance "
+                    "settings with search.formats including json."
+                ) from exc
+            raise
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "SearXNG did not return JSON. Make sure MEMEAGENT_SEARXNG_URL "
+                "points to a SearXNG instance with format=json enabled."
+            ) from exc
+
+        raw_results = payload.get("results") if isinstance(payload, dict) else []
+        if not isinstance(raw_results, list):
+            return []
+
+        results: list[dict[str, Any]] = []
+        for item in raw_results:
+            if not isinstance(item, dict):
+                continue
+            normalized = self._normalize_searxng_item(item)
+            href = _clean_text(normalized.get("href"))
+            title = _clean_text(normalized.get("title"))
+            if href or title:
+                results.append(normalized)
+            if len(results) >= max_results:
+                break
+        return results
+
+    def _searxng_endpoint(self) -> str:
+        base_url = _clean_text(self.config.searxng_url) or _SEARXNG_DEFAULT_URL
+        base_url = base_url.rstrip("/")
+        return base_url if base_url.endswith("/search") else f"{base_url}/search"
+
+    def _normalize_searxng_item(self, item: dict[str, Any]) -> dict[str, Any]:
+        engines = item.get("engines")
+        if isinstance(engines, list):
+            engine_source = ", ".join(_clean_text(engine) for engine in engines)
+        else:
+            engine_source = _clean_text(engines)
+        source = (
+            _clean_text(item.get("engine"))
+            or engine_source
+            or _clean_text(item.get("source"))
+            or "SearXNG"
+        )
+
+        return {
+            "title": _clean_text(item.get("title")) or "SearXNG result",
+            "body": _clean_text(
+                item.get("content")
+                or item.get("description")
+                or item.get("snippet")
+                or item.get("body")
+            ),
+            "href": _clean_text(item.get("url") or item.get("href") or item.get("link")),
+            "source": source,
+            "date": _clean_text(
+                item.get("publishedDate")
+                or item.get("pubdate")
+                or item.get("published")
+                or item.get("date")
+            ),
+        }
+
+    def _search_google_text(self, query: str) -> list[dict[str, Any]]:
+        if google_search is None:
+            raise ValueError(
+                "googlesearch-python is required for Google search. "
+                "Install it with: pip install googlesearch-python"
+            )
+
+        base_kwargs: dict[str, Any] = {
+            "num_results": self.config.search_max_results,
+            "lang": self._google_search_lang(),
+            "advanced": True,
+            "unique": True,
+        }
+        if self.config.search_country:
+            base_kwargs["region"] = self.config.search_country.lower()
+        if self.config.search_proxy:
+            base_kwargs["proxy"] = self.config.search_proxy
+
+        candidate_kwargs = [
+            {**base_kwargs, "timeout": self.config.search_timeout},
+            base_kwargs,
+        ]
+        last_type_error: TypeError | None = None
+        for kwargs in candidate_kwargs:
+            try:
+                raw_results = list(google_search(query, **kwargs))
+                results: list[dict[str, Any]] = []
+                for item in raw_results:
+                    normalized = self._normalize_google_item(item)
+                    href = _clean_text(normalized.get("href"))
+                    title = _clean_text(normalized.get("title"))
+                    if href or title:
+                        results.append(normalized)
+                return results
+            except TypeError as exc:
+                last_type_error = exc
+
+        if last_type_error:
+            raise last_type_error
+        return []
+
+    def _google_search_lang(self) -> str:
+        lang = (self.config.search_lang or "en").strip().replace("_", "-")
+        return (lang.split("-", 1)[0] or "en").lower()
+
+    def _normalize_google_item(self, item: Any) -> dict[str, Any]:
+        if isinstance(item, str):
+            href = _clean_text(item)
+            return {
+                "title": href,
+                "body": "",
+                "href": href,
+                "source": "Google",
+            }
+
+        if isinstance(item, dict):
+            title = _clean_text(item.get("title"))
+            body = _clean_text(
+                item.get("description") or item.get("body") or item.get("snippet")
+            )
+            href = _clean_text(item.get("url") or item.get("href") or item.get("link"))
+        else:
+            title = _clean_text(getattr(item, "title", ""))
+            body = _clean_text(
+                getattr(item, "description", "")
+                or getattr(item, "body", "")
+                or getattr(item, "snippet", "")
+            )
+            href = _clean_text(
+                getattr(item, "url", "")
+                or getattr(item, "href", "")
+                or getattr(item, "link", "")
+            )
+
+        return {
+            "title": title or href or "Google result",
+            "body": body,
+            "href": href,
+            "source": "Google",
+        }
 
     def _open_ddgs(self):
         candidates: list[dict[str, Any]] = []

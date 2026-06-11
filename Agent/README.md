@@ -152,6 +152,36 @@ MEMEAGENT_SEARCH_PROVIDER=ddgs,zhihu
 MEMEAGENT_ZHIHU_API_KEY=your_zhihu_access_secret
 ```
 
+To use Google results through `googlesearch-python`:
+
+```bash
+MEMEAGENT_SEARCH_PROVIDER=google
+```
+
+To use a self-hosted SearXNG instance:
+
+```bash
+MEMEAGENT_SEARCH_PROVIDER=searxng
+MEMEAGENT_SEARXNG_URL=http://localhost:8888
+```
+
+The SearXNG instance must allow JSON output, for example:
+
+```yaml
+search:
+  formats:
+    - html
+    - json
+```
+
+Optional SearXNG tuning:
+
+```bash
+MEMEAGENT_SEARXNG_ENGINES=google,bing,brave
+MEMEAGENT_SEARXNG_WEB_CATEGORIES=general
+MEMEAGENT_SEARXNG_NEWS_CATEGORIES=news
+```
+
 For a more stable all-web search API, use Brave Search:
 
 ```bash
