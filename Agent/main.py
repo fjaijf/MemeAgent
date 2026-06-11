@@ -39,7 +39,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--search",
         action="store_true",
-        help="Run a web-searching agent before meme analysis.",
+        help="Allow MemeAgent to decide whether web/news retrieval is needed.",
+    )
+    parser.add_argument(
+        "--force-search",
+        action="store_true",
+        help="Force web/news retrieval and skip the LLM retrieval-needed decision.",
     )
     parser.add_argument(
         "--show-search",
@@ -173,6 +178,7 @@ def main() -> None:
     project_root = Path(__file__).resolve().parent
     load_dotenv(project_root / ".env")
     args = parse_args()
+    search_requested = args.search or args.force_search
 
     if args.list_tasks:
         print("Available MemeAgent task heads:")
@@ -260,7 +266,7 @@ def main() -> None:
                 model=config.model,
                 image_count=len(args.image) + len(args.image_url),
                 timeout=config.timeout,
-                search_enabled=args.search,
+                search_enabled=search_requested,
                 search_provider=config.search_provider,
                 web_results=config.search_max_results,
                 news_results=config.news_max_results,
@@ -286,7 +292,7 @@ def main() -> None:
             retrieval_plan: str,
         ) -> None:
             nonlocal search_shown
-            if not (args.stream and args.search and args.show_search):
+            if not (args.stream and search_requested and args.show_search):
                 return
             search_shown = True
             ui.stop_activity()
@@ -306,9 +312,14 @@ def main() -> None:
                 image_paths=args.image,
                 image_urls=args.image_url,
                 task_heads=args.task,
-                use_search=args.search,
+                use_search=search_requested,
+                force_search=args.force_search,
                 progress=ui.update,
-                search_ready=handle_search_ready if args.search and args.show_search else None,
+                search_ready=(
+                    handle_search_ready
+                    if search_requested and args.show_search
+                    else None
+                ),
                 iterative_search=args.iterative_search,
                 search_max_rounds=args.search_max_rounds,
             )
@@ -319,7 +330,7 @@ def main() -> None:
                 search_report=result.search_report,
                 visual_report=result.visual_report,
                 retrieval_plan=result.retrieval_plan,
-                show_search=args.search and args.show_search,
+                show_search=search_requested and args.show_search,
                 analysis_title="Task Heads",
             )
             return
@@ -329,7 +340,8 @@ def main() -> None:
             context=args.context,
             image_paths=args.image,
             image_urls=args.image_url,
-            use_search=args.search,
+            use_search=search_requested,
+            force_search=args.force_search,
             progress=handle_progress if args.stream else ui.update,
             stream_analysis=args.stream,
             analysis_delta=ui.stream_delta if args.stream else None,
@@ -339,7 +351,7 @@ def main() -> None:
         )
         if args.stream:
             ui.stop_stream()
-            if args.search and args.show_search and not search_shown:
+            if search_requested and args.show_search and not search_shown:
                 ui.print_result(
                     analysis="",
                     input_mode=result.input_mode,
@@ -356,7 +368,7 @@ def main() -> None:
                 search_report=result.search_report,
                 visual_report=result.visual_report,
                 retrieval_plan=result.retrieval_plan,
-                show_search=args.search and args.show_search,
+                show_search=search_requested and args.show_search,
             )
     except KeyboardInterrupt:
         ui.stop_activity()

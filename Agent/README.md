@@ -68,10 +68,16 @@ MEMEAGENT_TIMEOUT=180
 MEMEAGENT_MAX_TOKENS=1200
 ```
 
-To search the public web first and feed the results into the analysis:
+To allow MemeAgent to decide whether public web/news retrieval is needed:
 
 ```bash
 python main.py --topic "PEPE" --search --show-search
+```
+
+To bypass that retrieval-needed decision and force web/news retrieval:
+
+```bash
+python main.py --topic "PEPE" --force-search --show-search
 ```
 
 The CLI shows a terminal status panel and live activity indicator while it waits
@@ -117,11 +123,13 @@ as additional search context before the final meme analysis:
 python main.py --image path/to/meme.png --search --show-search
 ```
 
-When search is enabled, MemeAgent also asks the LLM for a constrained
-supplemental retrieval plan. The stable OCR/visual-anchor queries remain the
-primary search inputs; the LLM plan can add only a few extra web/news queries
-when the input provides concrete people, events, OCR phrases, platforms, or
-background clues.
+When `--search` is enabled, MemeAgent first asks the LLM whether external
+retrieval is needed. It can skip web/news retrieval when the input and local
+memory are already sufficient. When `--force-search` is enabled, MemeAgent skips
+that decision and directly plans retrieval queries before searching. The stable
+OCR/visual-anchor queries remain the primary search inputs; the LLM plan can add
+only a few extra web/news queries when the input provides concrete people,
+events, OCR phrases, platforms, or background clues.
 
 The search agent currently gathers research context for:
 

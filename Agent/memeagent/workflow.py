@@ -143,6 +143,64 @@ class MemeResearchWorkflow:
             )
         )
 
+    def _retrieval_decision_needs_search(self, retrieval_decision: str) -> bool:
+        match = re.search(
+            r"RETRIEVAL_NEEDED\s*:\s*(?:[-*]\s*)?(yes|no)\b",
+            retrieval_decision,
+            flags=re.I,
+        )
+        if match:
+            return match.group(1).lower() == "yes"
+        return True
+
+    def _prepare_retrieval_plan(
+        self,
+        topic: str,
+        context: str,
+        visual_report: str,
+        memory_report: str,
+        input_mode: str,
+        force_search: bool,
+        progress: Callable[[str, str], None] | None,
+    ) -> tuple[str, bool, str]:
+        if force_search:
+            self._emit_progress(
+                progress,
+                "planning",
+                "Force search enabled; planning retrieval queries.",
+            )
+            try:
+                retrieval_plan = self.meme_agent.plan_retrieval(
+                    topic=topic,
+                    context=context,
+                    visual_report=visual_report,
+                    input_mode=input_mode,
+                )
+            except Exception as exc:
+                raise RuntimeError("Forced retrieval planning LLM call failed.") from exc
+            return retrieval_plan, True, "Forced retrieval plan"
+
+        self._emit_progress(
+            progress,
+            "planning",
+            "Deciding whether external retrieval is needed.",
+        )
+        try:
+            retrieval_plan = self.meme_agent.decide_retrieval(
+                topic=topic,
+                context=context,
+                visual_report=visual_report,
+                memory_report=memory_report,
+                input_mode=input_mode,
+            )
+        except Exception as exc:
+            raise RuntimeError("Retrieval decision LLM call failed.") from exc
+        return (
+            retrieval_plan,
+            self._retrieval_decision_needs_search(retrieval_plan),
+            "Retrieval decision and query plan",
+        )
+
     def _label_search_report(self, search_report: str, round_index: int) -> str:
         if round_index <= 1:
             return search_report
@@ -248,6 +306,7 @@ class MemeResearchWorkflow:
         image_paths: list[str] | None = None,
         image_urls: list[str] | None = None,
         use_search: bool = True,
+        force_search: bool = False,
         progress: Callable[[str, str], None] | None = None,
         stream_analysis: bool = False,
         analysis_delta: Callable[[str], None] | None = None,
@@ -310,40 +369,47 @@ class MemeResearchWorkflow:
                     + visual_report
                 )
 
-        if use_search:
-            self._emit_progress(
-                progress,
-                "planning",
-                "Planning supplemental retrieval queries.",
-            )
-            try:
-                retrieval_plan = self.meme_agent.plan_retrieval(
-                    topic=topic,
-                    context=context,
-                    visual_report=visual_report,
-                    input_mode=input_mode,
-                )
-            except Exception as exc:
-                raise RuntimeError("Retrieval planning LLM call failed.") from exc
-            if retrieval_plan:
-                combined_parts.append("Supplemental retrieval plan:\n" + retrieval_plan)
-            self._emit_progress(progress, "planning", "Supplemental retrieval plan ready.")
-            search_report = self._run_search_with_reflection(
+        if use_search or force_search:
+            retrieval_plan, should_search, plan_label = self._prepare_retrieval_plan(
                 topic=topic,
                 context=context,
                 visual_report=visual_report,
-                retrieval_plan=retrieval_plan,
+                memory_report=memory_report,
                 input_mode=input_mode,
-                iterative_search=iterative_search,
-                search_max_rounds=search_max_rounds,
+                force_search=force_search,
                 progress=progress,
             )
-            combined_parts.append(
-                "Internet search findings. Cite source labels exactly as shown below. "
-                "Single-round labels look like [W1] or [N1]; iterative retrieval may "
-                "also include labels such as [R2-W1] or [R2-N1]:\n"
-                + search_report
-            )
+            if retrieval_plan:
+                combined_parts.append(f"{plan_label}:\n" + retrieval_plan)
+            if should_search:
+                planning_message = (
+                    "External retrieval forced."
+                    if force_search
+                    else "External retrieval approved."
+                )
+                self._emit_progress(progress, "planning", planning_message)
+                search_report = self._run_search_with_reflection(
+                    topic=topic,
+                    context=context,
+                    visual_report=visual_report,
+                    retrieval_plan=retrieval_plan,
+                    input_mode=input_mode,
+                    iterative_search=iterative_search,
+                    search_max_rounds=search_max_rounds,
+                    progress=progress,
+                )
+                combined_parts.append(
+                    "Internet search findings. Cite source labels exactly as shown below. "
+                    "Single-round labels look like [W1] or [N1]; iterative retrieval may "
+                    "also include labels such as [R2-W1] or [R2-N1]:\n"
+                    + search_report
+                )
+            else:
+                self._emit_progress(
+                    progress,
+                    "planning",
+                    "External retrieval skipped by LLM decision.",
+                )
 
         combined_context = "\n\n".join(part for part in combined_parts if part).strip()
         if search_ready:
@@ -429,6 +495,7 @@ class MemeResearchWorkflow:
         image_urls: list[str] | None = None,
         task_heads: list[str] | None = None,
         use_search: bool = True,
+        force_search: bool = False,
         progress: Callable[[str, str], None] | None = None,
         search_ready: Callable[[str, str, str, str], None] | None = None,
         iterative_search: bool = False,
@@ -490,40 +557,47 @@ class MemeResearchWorkflow:
                     + visual_report
                 )
 
-        if use_search:
-            self._emit_progress(
-                progress,
-                "planning",
-                "Planning supplemental retrieval queries.",
-            )
-            try:
-                retrieval_plan = self.meme_agent.plan_retrieval(
-                    topic=topic,
-                    context=context,
-                    visual_report=visual_report,
-                    input_mode=input_mode,
-                )
-            except Exception as exc:
-                raise RuntimeError("Retrieval planning LLM call failed.") from exc
-            if retrieval_plan:
-                combined_parts.append("Supplemental retrieval plan:\n" + retrieval_plan)
-            self._emit_progress(progress, "planning", "Supplemental retrieval plan ready.")
-            search_report = self._run_search_with_reflection(
+        if use_search or force_search:
+            retrieval_plan, should_search, plan_label = self._prepare_retrieval_plan(
                 topic=topic,
                 context=context,
                 visual_report=visual_report,
-                retrieval_plan=retrieval_plan,
+                memory_report=memory_report,
                 input_mode=input_mode,
-                iterative_search=iterative_search,
-                search_max_rounds=search_max_rounds,
+                force_search=force_search,
                 progress=progress,
             )
-            combined_parts.append(
-                "Internet search findings. Cite source labels exactly as shown below. "
-                "Single-round labels look like [W1] or [N1]; iterative retrieval may "
-                "also include labels such as [R2-W1] or [R2-N1]:\n"
-                + search_report
-            )
+            if retrieval_plan:
+                combined_parts.append(f"{plan_label}:\n" + retrieval_plan)
+            if should_search:
+                planning_message = (
+                    "External retrieval forced."
+                    if force_search
+                    else "External retrieval approved."
+                )
+                self._emit_progress(progress, "planning", planning_message)
+                search_report = self._run_search_with_reflection(
+                    topic=topic,
+                    context=context,
+                    visual_report=visual_report,
+                    retrieval_plan=retrieval_plan,
+                    input_mode=input_mode,
+                    iterative_search=iterative_search,
+                    search_max_rounds=search_max_rounds,
+                    progress=progress,
+                )
+                combined_parts.append(
+                    "Internet search findings. Cite source labels exactly as shown below. "
+                    "Single-round labels look like [W1] or [N1]; iterative retrieval may "
+                    "also include labels such as [R2-W1] or [R2-N1]:\n"
+                    + search_report
+                )
+            else:
+                self._emit_progress(
+                    progress,
+                    "planning",
+                    "External retrieval skipped by LLM decision.",
+                )
 
         combined_context = "\n\n".join(part for part in combined_parts if part).strip()
         if search_ready:

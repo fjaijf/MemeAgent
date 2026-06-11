@@ -167,6 +167,73 @@ QUERY_CAUTIONS:
         response = self.llm.invoke(messages)
         return _normalize_content(getattr(response, "content", response))
 
+    def decide_retrieval(
+        self,
+        topic: str = "",
+        context: str = "",
+        visual_report: str = "",
+        memory_report: str = "",
+        input_mode: str = "text_only",
+    ) -> str:
+        user_prompt = f"""
+Topic hint: {topic or "None"}
+
+Input mode: {input_mode}
+
+User-provided context:
+{context or "None"}
+
+Local MemeAgent memory:
+{memory_report or "None"}
+
+Image-derived visual report:
+{visual_report or "None"}
+
+Decide whether MemeAgent needs external web/news retrieval before final meme analysis.
+Use local memory and the provided image/text evidence first. Retrieval is optional.
+
+Choose RETRIEVAL_NEEDED: no when:
+- the user asks for general interpretation, translation, OCR-based analysis, or reasoning that can be done from the given evidence
+- local memory already contains enough relevant prior analysis
+- there are no concrete searchable anchors such as names, exact phrases, events, places, platforms, organizations, or dates
+
+Choose RETRIEVAL_NEEDED: yes only when retrieval can answer concrete evidence questions, such as:
+- identifying the original post, platform context, meme template, source event, public figure, controversy, or exact OCR phrase
+- checking whether a claim, event, screenshot, or quoted text refers to real public context
+- resolving an evidence gap that materially affects harmfulness, intent, target, or reception analysis
+
+Rules:
+- Do not invent entities or events not supported by the input.
+- If retrieval is needed, propose only concrete, short queries.
+- If memory is sufficient, say so and do not propose queries.
+
+Return exactly these sections:
+RETRIEVAL_NEEDED:
+- yes or no
+
+DECISION_REASON:
+- One concise sentence.
+
+EVIDENCE_QUESTIONS:
+- 0-4 concrete questions retrieval should answer. Use "None" if retrieval is not needed.
+
+SUPPLEMENTAL_WEB_QUERIES:
+- 0-4 short queries. Use "None" if retrieval is not needed.
+
+SUPPLEMENTAL_NEWS_QUERIES:
+- 0-2 short news-friendly queries. Use "None" if retrieval is not needed.
+
+QUERY_CAUTIONS:
+- 1-3 cautions about what should not be assumed without evidence.
+""".strip()
+
+        messages = [
+            SystemMessage(content=self.system_prompt),
+            HumanMessage(content=user_prompt),
+        ]
+        response = self.llm.invoke(messages)
+        return _normalize_content(getattr(response, "content", response))
+
     def reflect_retrieval(
         self,
         topic: str = "",
