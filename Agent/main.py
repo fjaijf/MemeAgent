@@ -10,7 +10,7 @@ from memeagent.agent import MemeAgent
 from memeagent.cli_ui import MemeAgentCLI, RunSummary
 from memeagent.config import MemeAgentConfig
 from memeagent.heads import HEADS
-from memeagent.llm import create_llm
+from memeagent.llm import create_controller_llm, create_llm
 from memeagent.memory import MemeMemoryStore
 from memeagent.search_agent import SearchAgentConfig, WebSearchAgent
 from memeagent.workflow import MemeResearchWorkflow
@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--search-provider",
         default=None,
-        help="Override search provider. Supported values include ddgs, google, searxng, brave, tavily, zhihu, or comma-separated combinations.",
+        help="Override search provider. Supported values include ddgs, google, searxng, brave, tavily, zhihu, qwen, glm, or comma-separated combinations.",
     )
     parser.add_argument(
         "--search-api-key",
@@ -76,6 +76,26 @@ def parse_args() -> argparse.Namespace:
         "--zhihu-api-key",
         default=None,
         help="Override Zhihu search API key.",
+    )
+    parser.add_argument(
+        "--qwen-search-model",
+        default=None,
+        help="Override Qwen model used for built-in search, for example qwen-plus.",
+    )
+    parser.add_argument(
+        "--qwen-search-base-url",
+        default=None,
+        help="Override Qwen OpenAI-compatible base URL.",
+    )
+    parser.add_argument(
+        "--glm-search-engine",
+        default=None,
+        help="Override GLM web search engine, for example search_pro.",
+    )
+    parser.add_argument(
+        "--glm-search-domain-filter",
+        default=None,
+        help="Restrict GLM web search to one domain, for example www.sohu.com.",
     )
     parser.add_argument(
         "--searxng-url",
@@ -215,6 +235,16 @@ def main() -> None:
         search_overrides["search_api_key"] = args.search_api_key.strip() or None
     if args.zhihu_api_key is not None:
         search_overrides["zhihu_api_key"] = args.zhihu_api_key.strip() or None
+    if args.qwen_search_model is not None:
+        search_overrides["qwen_search_model"] = args.qwen_search_model.strip()
+    if args.qwen_search_base_url is not None:
+        search_overrides["qwen_search_base_url"] = args.qwen_search_base_url.strip()
+    if args.glm_search_engine is not None:
+        search_overrides["glm_search_engine"] = args.glm_search_engine.strip()
+    if args.glm_search_domain_filter is not None:
+        search_overrides["glm_search_domain_filter"] = (
+            args.glm_search_domain_filter.strip() or None
+        )
     if args.searxng_url is not None:
         search_overrides["searxng_url"] = args.searxng_url.strip()
     if args.searxng_engines is not None:
@@ -261,11 +291,25 @@ def main() -> None:
     )
     llm = create_llm(config)
     agent = MemeAgent(llm=llm, system_prompt=config.system_prompt)
+    controller_llm = create_controller_llm(config)
+    controller_agent = (
+        MemeAgent(llm=controller_llm, system_prompt=config.system_prompt)
+        if controller_llm is not None
+        else None
+    )
     search_agent = WebSearchAgent(
         SearchAgentConfig(
             search_provider=config.search_provider,
             search_api_key=config.search_api_key,
             zhihu_api_key=config.zhihu_api_key,
+            qwen_search_api_key=config.qwen_search_api_key,
+            qwen_search_base_url=config.qwen_search_base_url,
+            qwen_search_model=config.qwen_search_model,
+            glm_search_api_key=config.glm_search_api_key,
+            glm_search_engine=config.glm_search_engine,
+            glm_search_recency_filter=config.glm_search_recency_filter,
+            glm_search_content_size=config.glm_search_content_size,
+            glm_search_domain_filter=config.glm_search_domain_filter,
             search_proxy=config.search_proxy,
             searxng_url=config.searxng_url,
             searxng_engines=config.searxng_engines,
@@ -286,6 +330,7 @@ def main() -> None:
     )
     workflow = MemeResearchWorkflow(
         meme_agent=agent,
+        controller_agent=controller_agent,
         search_agent=search_agent,
         memory_store=memory_store,
         memory_recall_limit=config.memory_recall_limit,
@@ -324,7 +369,7 @@ def main() -> None:
             retrieval_plan: str,
         ) -> None:
             nonlocal search_shown
-            if not (args.stream and search_requested and args.show_search):
+            if not (search_requested and args.show_search):
                 return
             search_shown = True
             ui.stop_activity()
@@ -362,7 +407,7 @@ def main() -> None:
                 search_report=result.search_report,
                 visual_report=result.visual_report,
                 retrieval_plan=result.retrieval_plan,
-                show_search=search_requested and args.show_search,
+                show_search=search_requested and args.show_search and not search_shown,
                 analysis_title="Task Heads",
             )
             return
@@ -377,7 +422,7 @@ def main() -> None:
             progress=handle_progress if args.stream else ui.update,
             stream_analysis=args.stream,
             analysis_delta=ui.stream_delta if args.stream else None,
-            search_ready=handle_search_ready if args.stream else None,
+            search_ready=handle_search_ready if search_requested and args.show_search else None,
             iterative_search=args.iterative_search,
             search_max_rounds=args.search_max_rounds,
         )
@@ -400,7 +445,7 @@ def main() -> None:
                 search_report=result.search_report,
                 visual_report=result.visual_report,
                 retrieval_plan=result.retrieval_plan,
-                show_search=search_requested and args.show_search,
+                show_search=search_requested and args.show_search and not search_shown,
             )
     except KeyboardInterrupt:
         ui.stop_activity()

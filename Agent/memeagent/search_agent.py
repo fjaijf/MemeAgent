@@ -1,17 +1,21 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 import hashlib
 import json
 import logging
+import os
+from queue import Empty, Queue
 import re
-from threading import Lock
+from threading import Lock, Thread
 import time
 from typing import Any
 from urllib.error import HTTPError
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import ProxyHandler, Request, build_opener, urlopen
+
+import requests
 
 try:
     from ddgs import DDGS
@@ -23,6 +27,18 @@ try:
 except ImportError:
     google_search = None
 
+try:
+    from zai import ZhipuAiClient as ZaiZhipuAiClient
+except (ImportError, AttributeError):
+    ZhipuAiClient = None
+else:
+    ZhipuAiClient = ZaiZhipuAiClient
+
+try:
+    from zhipuai import ZhipuAI
+except ImportError:
+    ZhipuAI = None
+
 from .cache import SearchResultCache
 
 
@@ -32,7 +48,9 @@ _BRAVE_WEB_API = "https://api.search.brave.com/res/v1/web/search"
 _BRAVE_NEWS_API = "https://api.search.brave.com/res/v1/news/search"
 _TAVILY_SEARCH_API = "https://api.tavily.com/search"
 _ZHIHU_SEARCH_API = "https://developer.zhihu.com/api/v1/content/zhihu_search"
+_QWEN_COMPATIBLE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 _SEARXNG_DEFAULT_URL = "http://localhost:8888"
+_SEARCH_PARALLEL_WORKERS = 8
 _DEFAULT_CONTEXT_SITES = (
     "reddit.com",
     "x.com",
@@ -65,6 +83,14 @@ class SearchAgentConfig:
     search_provider: str = "ddgs"
     search_api_key: str | None = None
     zhihu_api_key: str | None = None
+    qwen_search_api_key: str | None = None
+    qwen_search_base_url: str = _QWEN_COMPATIBLE_BASE_URL
+    qwen_search_model: str = "qwen-plus"
+    glm_search_api_key: str | None = None
+    glm_search_engine: str = "search_pro"
+    glm_search_recency_filter: str = "noLimit"
+    glm_search_content_size: str = "medium"
+    glm_search_domain_filter: str | None = None
     search_proxy: str | None = None
     searxng_url: str = _SEARXNG_DEFAULT_URL
     searxng_engines: str | None = None
@@ -198,6 +224,39 @@ def _is_site_query(value: str) -> bool:
     return value.strip().lower().startswith("site:")
 
 
+def _with_news_intent(value: str) -> str:
+    query = _compact_query_text(value, max_chars=180)
+    lowered = query.lower()
+    if any(term in lowered for term in ("news", "controversy", "\u65b0\u95fb", "\u4e89\u8bae")):
+        return query
+    return f"{query} news" if query else "news"
+
+
+def _strip_list_marker(value: str) -> str:
+    return re.sub(r"^(\d+[.)]\s*|[-*]\s+)", "", value).strip()
+
+
+def _clean_visual_query(value: str) -> str:
+    value = _strip_query_noise(value)
+    value = value.replace('"', " ")
+    value = value.replace("*", " ")
+    value = re.sub(r"\b(?:meme|memes|template|templates)\b", " ", value, flags=re.I)
+    value = re.sub(r"\bchinese\s+text\b", " ", value, flags=re.I)
+    value = re.sub(r"\btext\b", " ", value, flags=re.I)
+    value = re.sub(r"(?:表情包|梗图|模板)", " ", value)
+    value = re.sub(r"\s+", " ", value)
+    return value.strip(" -:：")
+
+
+def _is_markdown_section_heading(value: str) -> bool:
+    line = value.strip()
+    if not line:
+        return False
+    if re.match(r"^(\d+[.)]\s*)?\*{0,2}[^:：]{2,120}\*{0,2}\s*[:：]\s*$", line):
+        return True
+    return bool(re.match(r"^[A-Z_ ]+[:：]\s*$", line))
+
+
 def _url_host(value: str) -> str:
     lowered = value.lower()
     lowered = re.sub(r"^https?://", "", lowered)
@@ -294,7 +353,15 @@ class WebSearchAgent:
         anchors: list[str] = []
         anchors.extend(re.findall(r'"([^"]{2,120})"', context))
 
+        anchors.extend(self._extract_visual_suggested_queries(context, limit=8))
+
+        cleaned = [_strip_query_noise(anchor) for anchor in anchors]
+        return _dedupe_strings([anchor for anchor in cleaned if _is_useful_query(anchor)])[:8]
+
+    def _extract_visual_suggested_queries(self, context: str, limit: int) -> list[str]:
+        queries: list[str] = []
         in_suggested_queries = False
+
         for raw_line in context.splitlines():
             line = raw_line.strip()
             if not line:
@@ -307,14 +374,21 @@ class WebSearchAgent:
             ):
                 in_suggested_queries = True
                 continue
-            if in_suggested_queries and re.match(r"^(\d+\.|[-*]\s+)", line):
-                anchors.append(re.sub(r"^(\d+\.\s*|[-*]\s+)", "", line).strip())
+
+            if not in_suggested_queries:
                 continue
-            if in_suggested_queries and re.match(r"^[A-Z][A-Za-z /-]+:", line):
+
+            if re.match(r"^(\d+[.)]\s*|[-*]\s+)", line):
+                query = _strip_list_marker(line).strip()
+                if query and not _is_none_query(query):
+                    queries.append(query)
+                continue
+
+            if _is_markdown_section_heading(line):
                 in_suggested_queries = False
 
-        cleaned = [_strip_query_noise(anchor) for anchor in anchors]
-        return _dedupe_strings([anchor for anchor in cleaned if _is_useful_query(anchor)])[:8]
+        cleaned = [_clean_visual_query(query) for query in queries]
+        return _dedupe_strings([query for query in cleaned if _is_useful_query(query)])[:limit]
 
     def _build_relevance_terms(
         self,
@@ -343,6 +417,10 @@ class WebSearchAgent:
 
     def _build_query_plan(self, topic: str, context: str = "") -> list[PlannedSearchQuery]:
         topic = _strip_query_noise(_clean_text(topic))
+        visual_suggested_queries = self._extract_visual_suggested_queries(
+            context,
+            limit=6,
+        )
         anchors = self._extract_visual_search_anchors(context)
         supplemental_web_queries = self._extract_supplemental_queries(
             context,
@@ -358,7 +436,9 @@ class WebSearchAgent:
         seen: set[str] = set()
         if _is_useful_query(topic):
             self._add_planned_query(plan, seen, topic, "topic")
-            self._add_planned_query(plan, seen, f"{topic} meme", "topic")
+
+        for query in visual_suggested_queries:
+            self._add_planned_query(plan, seen, query, "visual_suggested")
 
         for anchor in anchors[:5]:
             quoted_anchor = _quote_query(anchor)
@@ -367,10 +447,10 @@ class WebSearchAgent:
             self._add_planned_query(plan, seen, anchor, "anchor_context")
             if topic and not _contains_word(anchor, topic):
                 self._add_planned_query(plan, seen, f"{topic} {anchor}", "topic_anchor")
-            if not _contains_word(anchor, "meme") and not _contains_word(anchor, "memes"):
-                self._add_planned_query(plan, seen, f"{anchor} meme", "meme_context")
 
         for anchor in anchors[:3]:
+            if anchor in visual_suggested_queries:
+                continue
             quoted_anchor = _quote_query(anchor)
             if not quoted_anchor:
                 continue
@@ -494,9 +574,19 @@ class WebSearchAgent:
                 query,
                 max_results=self.config.search_max_results,
             )
+        if provider == "qwen":
+            return self._search_qwen(
+                query,
+                max_results=self.config.search_max_results,
+            )
+        if provider in {"glm", "zai", "zhipu"}:
+            return self._search_glm(
+                query,
+                max_results=self.config.search_max_results,
+            )
         raise ValueError(
             f"Unsupported search provider '{provider}'. "
-            "Use ddgs, google, searxng, brave, tavily, or zhihu."
+            "Use ddgs, google, searxng, brave, tavily, zhihu, qwen, or glm."
         )
 
     def _search_news(self, query: str) -> list[dict[str, Any]]:
@@ -560,9 +650,21 @@ class WebSearchAgent:
             )
         if provider == "zhihu":
             return []
+        if provider == "qwen":
+            return self._search_qwen(
+                query,
+                max_results=self.config.news_max_results,
+                news=True,
+            )
+        if provider in {"glm", "zai", "zhipu"}:
+            return self._search_glm(
+                query,
+                max_results=self.config.news_max_results,
+                news=True,
+            )
         raise ValueError(
             f"Unsupported search provider '{provider}'. "
-            "Use ddgs, google, searxng, brave, tavily, or zhihu."
+            "Use ddgs, google, searxng, brave, tavily, zhihu, qwen, or glm."
         )
 
     def _cached_provider_search(
@@ -606,7 +708,7 @@ class WebSearchAgent:
 
     def _build_cache_key(self, kind: str, provider: str, query: str) -> str:
         payload = {
-            "version": 1,
+            "version": 2,
             "kind": kind,
             "provider": provider,
             "query": query,
@@ -620,6 +722,12 @@ class WebSearchAgent:
             "searxng_engines": self.config.searxng_engines,
             "searxng_web_categories": self.config.searxng_web_categories,
             "searxng_news_categories": self.config.searxng_news_categories,
+            "qwen_search_base_url": self.config.qwen_search_base_url,
+            "qwen_search_model": self.config.qwen_search_model,
+            "glm_search_engine": self.config.glm_search_engine,
+            "glm_search_recency_filter": self.config.glm_search_recency_filter,
+            "glm_search_content_size": self.config.glm_search_content_size,
+            "glm_search_domain_filter": self.config.glm_search_domain_filter,
         }
         raw_key = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
@@ -638,7 +746,6 @@ class WebSearchAgent:
         max_results: int,
         categories: str,
     ) -> list[dict[str, Any]]:
-        endpoint = self._searxng_endpoint()
         params: dict[str, str] = {
             "q": query,
             "format": "json",
@@ -652,8 +759,10 @@ class WebSearchAgent:
         if engines:
             params["engines"] = engines
 
+        endpoint, existing_params = self._searxng_endpoint_and_params()
+        existing_params.update(params)
         req = Request(
-            f"{endpoint}?{urlencode(params)}",
+            f"{endpoint}?{urlencode(existing_params)}",
             headers={
                 "Accept": "application/json",
                 "User-Agent": "MemeAgent/0.1",
@@ -661,7 +770,7 @@ class WebSearchAgent:
         )
         try:
             with self._open_url(req) as resp:
-                payload = json.loads(resp.read())
+                payload = json.loads(resp.read().decode("utf-8"))
         except HTTPError as exc:
             if exc.code == 403:
                 raise ValueError(
@@ -693,9 +802,22 @@ class WebSearchAgent:
         return results
 
     def _searxng_endpoint(self) -> str:
+        endpoint, _params = self._searxng_endpoint_and_params()
+        return endpoint
+
+    def _searxng_endpoint_and_params(self) -> tuple[str, dict[str, str]]:
         base_url = _clean_text(self.config.searxng_url) or _SEARXNG_DEFAULT_URL
-        base_url = base_url.rstrip("/")
-        return base_url if base_url.endswith("/search") else f"{base_url}/search"
+        parts = urlsplit(base_url)
+        path = parts.path.rstrip("/")
+        if not path.endswith("/search"):
+            path = f"{path}/search" if path else "/search"
+        endpoint = urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+        params = {
+            key: value
+            for key, value in parse_qsl(parts.query, keep_blank_values=False)
+            if key
+        }
+        return endpoint, params
 
     def _normalize_searxng_item(self, item: dict[str, Any]) -> dict[str, Any]:
         engines = item.get("engines")
@@ -716,16 +838,19 @@ class WebSearchAgent:
                 item.get("content")
                 or item.get("description")
                 or item.get("snippet")
+                or item.get("summary")
                 or item.get("body")
             ),
             "href": _clean_text(item.get("url") or item.get("href") or item.get("link")),
             "source": source,
             "date": _clean_text(
                 item.get("publishedDate")
+                or item.get("published_date")
                 or item.get("pubdate")
                 or item.get("published")
                 or item.get("date")
             ),
+            "thumbnail": _clean_text(item.get("thumbnail")),
         }
 
     def _search_google_text(self, query: str) -> list[dict[str, Any]]:
@@ -926,6 +1051,174 @@ class WebSearchAgent:
             if isinstance(item, dict)
         ]
 
+    def _search_qwen(
+        self,
+        query: str,
+        max_results: int,
+        news: bool = False,
+    ) -> list[dict[str, Any]]:
+        api_key = (
+            self.config.qwen_search_api_key
+            or self.config.search_api_key
+            or os.getenv("DASHSCOPE_API_KEY")
+            or os.getenv("OPENAI_API_KEY")
+        )
+        if not api_key:
+            raise ValueError(
+                "DASHSCOPE_API_KEY, OPENAI_API_KEY, MEMEAGENT_QWEN_SEARCH_API_KEY, "
+                "or MEMEAGENT_SEARCH_API_KEY is required for Qwen search"
+            )
+
+        prompt = query if not news else _with_news_intent(query)
+        base_url = _clean_text(self.config.qwen_search_base_url) or _QWEN_COMPATIBLE_BASE_URL
+        endpoint = base_url.rstrip("/")
+        if endpoint.endswith("/chat/completions"):
+            url = endpoint
+        else:
+            url = f"{endpoint}/chat/completions"
+
+        payload: dict[str, Any] = {
+            "model": self.config.qwen_search_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a web search retriever. Return concise factual "
+                        "findings and include source URLs when available."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0,
+            "enable_search": True,
+        }
+        request_kwargs: dict[str, Any] = {
+            "headers": {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            "json": payload,
+            "timeout": self.config.search_timeout,
+        }
+        if self.config.search_proxy:
+            request_kwargs["proxies"] = {
+                "http": self.config.search_proxy,
+                "https": self.config.search_proxy,
+            }
+
+        response = requests.post(url, **request_kwargs)
+        response.raise_for_status()
+        payload = response.json()
+        return self._normalize_qwen_payload(payload, query=query, max_results=max_results)
+
+    def _normalize_qwen_payload(
+        self,
+        payload: Any,
+        query: str,
+        max_results: int,
+    ) -> list[dict[str, Any]]:
+        payload = self._object_to_plain_data(payload)
+        choices = payload.get("choices") if isinstance(payload, dict) else []
+        message = {}
+        if choices and isinstance(choices[0], dict):
+            message = choices[0].get("message") or {}
+
+        content = _clean_text(message.get("content") if isinstance(message, dict) else "")
+        candidates: list[Any] = []
+        if isinstance(message, dict):
+            for key in (
+                "search_info",
+                "search_results",
+                "citations",
+                "references",
+                "annotations",
+            ):
+                value = message.get(key)
+                if value:
+                    candidates.extend(value if isinstance(value, list) else [value])
+        if isinstance(payload, dict):
+            for key in ("search_info", "search_results", "citations", "references"):
+                value = payload.get(key)
+                if value:
+                    candidates.extend(value if isinstance(value, list) else [value])
+
+        results = [
+            self._normalize_vendor_search_item(item, default_source="Qwen Search")
+            for item in candidates
+            if isinstance(item, dict)
+        ]
+        results = [
+            item
+            for item in results
+            if _clean_text(item.get("title")) or _clean_text(item.get("body")) or _clean_text(item.get("href"))
+        ]
+        if results:
+            return results[:max_results]
+        if not content:
+            return []
+        return [
+            {
+                "title": f"Qwen search answer: {query}",
+                "body": content,
+                "href": "",
+                "source": "Qwen Search",
+            }
+        ][:max_results]
+
+    def _search_glm(
+        self,
+        query: str,
+        max_results: int,
+        news: bool = False,
+    ) -> list[dict[str, Any]]:
+        if ZhipuAiClient is None:
+            if ZhipuAI is None:
+                raise ValueError(
+                    "zhipuai or zai is required for GLM search. "
+                    "Install it with: pip install zhipuai"
+                )
+
+        api_key = (
+            self.config.glm_search_api_key
+            or self.config.search_api_key
+            or os.getenv("ZAI_API_KEY")
+            or os.getenv("GLM_API_KEY")
+            or os.getenv("ZHIPUAI_API_KEY")
+        )
+        if not api_key:
+            raise ValueError(
+                "ZAI_API_KEY, GLM_API_KEY, ZHIPUAI_API_KEY, "
+                "MEMEAGENT_GLM_SEARCH_API_KEY, or MEMEAGENT_SEARCH_API_KEY "
+                "is required for GLM search"
+            )
+
+        client = (
+            ZhipuAiClient(api_key=api_key)
+            if ZhipuAiClient is not None
+            else ZhipuAI(api_key=api_key)
+        )
+        kwargs: dict[str, Any] = {
+            "search_engine": self.config.glm_search_engine,
+            "search_query": query if not news else _with_news_intent(query),
+            "count": max_results,
+            "search_recency_filter": self.config.glm_search_recency_filter,
+            "content_size": self.config.glm_search_content_size,
+        }
+        if self.config.glm_search_domain_filter:
+            kwargs["search_domain_filter"] = self.config.glm_search_domain_filter
+
+        response = client.web_search.web_search(**kwargs)
+        return self._normalize_glm_payload(response, max_results=max_results)
+
+    def _normalize_glm_payload(self, payload: Any, max_results: int) -> list[dict[str, Any]]:
+        payload = self._object_to_plain_data(payload)
+        raw_results = self._extract_result_list(payload)
+        return [
+            self._normalize_vendor_search_item(item, default_source="GLM Search")
+            for item in raw_results[:max_results]
+            if isinstance(item, dict)
+        ]
+
     def _search_zhihu(self, query: str, max_results: int) -> list[dict[str, Any]]:
         api_key = self.config.zhihu_api_key or self.config.search_api_key
         if not api_key:
@@ -955,6 +1248,7 @@ class WebSearchAgent:
         ]
 
     def _extract_result_list(self, payload: Any) -> list[Any]:
+        payload = self._object_to_plain_data(payload)
         if isinstance(payload, list):
             return payload
         if not isinstance(payload, dict):
@@ -971,6 +1265,12 @@ class WebSearchAgent:
             "List",
             "contents",
             "Contents",
+            "search_result",
+            "search_results",
+            "SearchResult",
+            "SearchResults",
+            "records",
+            "Records",
         ):
             value = payload.get(key)
             if isinstance(value, list):
@@ -991,6 +1291,89 @@ class WebSearchAgent:
             "ContentText",
         }
         return [payload] if any(key in payload for key in content_keys) else []
+
+    def _object_to_plain_data(self, value: Any) -> Any:
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if isinstance(value, list):
+            return [self._object_to_plain_data(item) for item in value]
+        if isinstance(value, tuple):
+            return [self._object_to_plain_data(item) for item in value]
+        if isinstance(value, dict):
+            return {key: self._object_to_plain_data(item) for key, item in value.items()}
+        for method_name in ("model_dump", "dict", "to_dict"):
+            method = getattr(value, method_name, None)
+            if callable(method):
+                try:
+                    return self._object_to_plain_data(method())
+                except TypeError:
+                    continue
+        if hasattr(value, "__dict__"):
+            return self._object_to_plain_data(vars(value))
+        return value
+
+    def _normalize_vendor_search_item(
+        self,
+        item: dict[str, Any],
+        default_source: str,
+    ) -> dict[str, Any]:
+        title = _clean_text(
+            item.get("title")
+            or item.get("Title")
+            or item.get("name")
+            or item.get("Name")
+            or item.get("site_name")
+            or item.get("SiteName")
+        )
+        body = _clean_text(
+            item.get("content")
+            or item.get("Content")
+            or item.get("summary")
+            or item.get("Summary")
+            or item.get("snippet")
+            or item.get("Snippet")
+            or item.get("description")
+            or item.get("Description")
+            or item.get("body")
+            or item.get("Body")
+            or item.get("text")
+            or item.get("Text")
+        )
+        href = _clean_text(
+            item.get("url")
+            or item.get("Url")
+            or item.get("href")
+            or item.get("Href")
+            or item.get("link")
+            or item.get("Link")
+            or item.get("source_url")
+            or item.get("SourceUrl")
+        )
+        source = _clean_text(
+            item.get("source")
+            or item.get("Source")
+            or item.get("media")
+            or item.get("Media")
+            or item.get("site")
+            or item.get("Site")
+        )
+        date = _clean_text(
+            item.get("date")
+            or item.get("Date")
+            or item.get("publish_time")
+            or item.get("PublishTime")
+            or item.get("published_time")
+            or item.get("PublishedTime")
+            or item.get("published_date")
+            or item.get("PublishedDate")
+        )
+        return {
+            "title": title or href or f"{default_source} result",
+            "body": body,
+            "href": href,
+            "source": source or default_source,
+            "date": date,
+        }
 
     def _normalize_zhihu_item(self, item: dict[str, Any]) -> dict[str, Any]:
         title = _clean_text(
@@ -1064,23 +1447,16 @@ class WebSearchAgent:
             queries = query_input
             relevance_terms = set()
 
-        results: list[dict[str, Any]] = []
-        errors: list[str] = []
-
-        for query in queries:
-            try:
-                results.extend(self._search_text(query))
-            except Exception as exc:
-                logger.debug("Web search failed for query=%s: %s", query, exc)
-                errors.append(f"{query}: {exc}")
-
+        results, errors = self._search_queries_in_parallel(
+            queries=queries,
+            search_fn=self._search_text_provider,
+            relevance_terms=relevance_terms,
+            max_results=self.config.search_max_results * len(self._search_providers()),
+            kind="web",
+        )
         if not results and errors:
             raise ValueError("; ".join(errors))
-        return self._dedupe_results(
-            results,
-            max_results=self.config.search_max_results * len(self._search_providers()),
-            relevance_terms=relevance_terms,
-        )
+        return results
 
     def _search_news_queries(
         self,
@@ -1093,24 +1469,97 @@ class WebSearchAgent:
             queries = query_input
 
         news_queries = self._build_news_queries(queries, context=context)[:6]
-        results: list[dict[str, Any]] = []
-        errors: list[str] = []
-
-        for query in news_queries:
-            try:
-                results.extend(self._search_news(query))
-            except Exception as exc:
-                logger.debug("News search failed for query=%s: %s", query, exc)
-                errors.append(f"{query}: {exc}")
-
+        relevance_terms = set().union(*(_query_terms(query) for query in news_queries))
+        results, errors = self._search_queries_in_parallel(
+            queries=news_queries,
+            search_fn=self._search_news_provider,
+            relevance_terms=relevance_terms,
+            max_results=self.config.news_max_results,
+            kind="news",
+        )
         if not results and errors:
             raise ValueError("; ".join(errors))
-        relevance_terms = set().union(*(_query_terms(query) for query in news_queries))
+        return results
+
+    def _search_queries_in_parallel(
+        self,
+        queries: list[str],
+        search_fn,
+        relevance_terms: set[str],
+        max_results: int,
+        kind: str,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        providers = self._search_providers()
+        tasks: list[tuple[int, str, str]] = [
+            (query_index * len(providers) + provider_index, provider, query)
+            for query_index, query in enumerate(queries)
+            for provider_index, provider in enumerate(providers)
+        ]
+        if not tasks:
+            return [], []
+
+        results: list[dict[str, Any]] = []
+        errors: list[str] = []
+        deadline = time.monotonic() + self.config.search_timeout
+
+        def run_task(provider: str, query: str) -> list[dict[str, Any]]:
+            return search_fn(provider, query)
+
+        executor = ThreadPoolExecutor(
+            max_workers=min(_SEARCH_PARALLEL_WORKERS, len(tasks)),
+            thread_name_prefix=f"memeagent-{kind}-search",
+        )
+        futures = {
+            executor.submit(run_task, provider, query): (order, provider, query)
+            for order, provider, query in tasks
+        }
+        pending = set(futures)
+
+        try:
+            while pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+
+                done, pending = wait(
+                    pending,
+                    timeout=remaining,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done:
+                    break
+
+                for future in done:
+                    order, provider, query = futures[future]
+                    try:
+                        task_results = future.result()
+                    except Exception as exc:
+                        logger.debug(
+                            "%s search provider %s failed for query=%s: %s",
+                            kind,
+                            provider,
+                            query,
+                            exc,
+                        )
+                        errors.append(f"{query} / {provider}: {exc}")
+                        continue
+
+                    for item in task_results:
+                        results.append(item)
+        finally:
+            if pending:
+                errors.append(
+                    f"{kind.capitalize()} search timed out with {len(pending)} task(s) unfinished"
+                )
+                for future in pending:
+                    future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+
         return self._dedupe_results(
             results,
-            max_results=self.config.news_max_results,
+            max_results=max_results,
             relevance_terms=relevance_terms,
-        )
+        ), errors
 
     def _dedupe_results(
         self,
@@ -1214,16 +1663,28 @@ class WebSearchAgent:
         query,
         label: str,
     ) -> tuple[list[dict[str, Any]], str | None]:
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(fn, query)
+        output: Queue[tuple[list[dict[str, Any]], Exception | None]] = Queue(maxsize=1)
+
+        def target() -> None:
             try:
-                return future.result(timeout=self.config.search_timeout), None
-            except FuturesTimeoutError:
-                future.cancel()
-                return [], f"{label} timed out after {self.config.search_timeout:.0f}s"
+                output.put((fn(query), None), block=False)
             except Exception as exc:
-                logger.debug("%s failed for query=%s: %s", label, query, exc)
-                return [], f"{label} failed: {exc}"
+                output.put(([], exc), block=False)
+
+        thread = Thread(target=target, daemon=True)
+        thread.start()
+        thread.join(timeout=self.config.search_timeout)
+        if thread.is_alive():
+            return [], f"{label} timed out after {self.config.search_timeout:.0f}s"
+
+        try:
+            results, exc = output.get_nowait()
+        except Empty:
+            return [], f"{label} failed without returning results"
+        if exc is not None:
+            logger.debug("%s failed for query=%s: %s", label, query, exc)
+            return [], f"{label} failed: {exc}"
+        return results, None
 
     def run(self, topic: str, context: str = "") -> str:
         self._reset_cache_stats()

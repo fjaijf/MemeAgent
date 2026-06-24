@@ -14,8 +14,10 @@ analysis, modeled after the way `TradingAgents` creates and calls LLMs:
 - `memeagent/llm.py`: creates the model client
 - `memeagent/agent.py`: contains the actual agent logic
 - `memeagent/search_agent.py`: retrieves public web and news context
+- `memeagent/retrieve_cli.py`: standalone retrieval CLI without LLM calls
 - `memeagent/workflow.py`: coordinates retrieval + meme analysis
 - `main.py`: command-line entrypoint
+- `retrieve.py`: command-line entrypoint for retrieval-only tuning
 
 ## Quick Start
 
@@ -68,6 +70,16 @@ MEMEAGENT_TIMEOUT=180
 MEMEAGENT_MAX_TOKENS=1200
 ```
 
+To use GLM as a separate controller for planning, retrieval decisions, and
+retrieval reflection while keeping the primary model for vision/final analysis:
+
+```bash
+MEMEAGENT_CONTROLLER_PROVIDER=glm
+MEMEAGENT_CONTROLLER_MODEL=glm-5.1
+MEMEAGENT_CONTROLLER_THINKING=true
+ZAI_API_KEY=your_zai_api_key
+```
+
 To allow MemeAgent to decide whether public web/news retrieval is needed:
 
 ```bash
@@ -78,6 +90,22 @@ To bypass that retrieval-needed decision and force web/news retrieval:
 
 ```bash
 python main.py --topic "PEPE" --force-search --show-search
+```
+
+To tune retrieval without spending tokens on planning, vision, or final
+analysis, use the retrieval-only entrypoint:
+
+```bash
+python retrieve.py --topic "PEPE" --mode plan
+python retrieve.py --topic "PEPE" --mode both
+python retrieve.py --query '"this is fine"' --mode web
+python retrieve.py --topic "PEPE" --context-file notes.txt --json --output runs/retrieval.json
+```
+
+If installed with `pip install -e .`, the same tool is available as:
+
+```bash
+meme-retrieve --topic "PEPE" --mode both
 ```
 
 The CLI shows a terminal status panel and live activity indicator while it waits
@@ -114,6 +142,25 @@ python main.py --image path/to/meme.png --search --show-search
 # Text and image: combine the text hint with image-derived keywords.
 python main.py --topic "a meme name or phrase" --image path/to/meme.png --search --show-search
 ```
+
+## Evaluation Script
+
+For harmful meme detection benchmarks, use the dedicated evaluator:
+
+```bash
+python evaluate_harmful_memes.py --dataset D:\自研Agent\Dataset\label_test.json --mode direct --resume
+```
+
+Common options:
+
+```bash
+python evaluate_harmful_memes.py --dataset D:\自研Agent\Dataset\label_test.json --schema auto --workers 4
+python evaluate_harmful_memes.py --dataset D:\自研Agent\Dataset\label_test.json --mode workflow --search
+python evaluate_harmful_memes.py --dataset D:\自研Agent\Dataset\label_test.json --limit 100 --workers 4 --output runs/eval.jsonl
+```
+
+The script writes per-sample predictions to JSONL and a summary metric file
+with accuracy, precision, recall, and F1.
 
 When images are attached, MemeAgent first asks the vision model to produce an
 OCR/visual-description/keyword report. That image-derived report is then used
@@ -182,6 +229,9 @@ MEMEAGENT_SEARXNG_WEB_CATEGORIES=general
 MEMEAGENT_SEARXNG_NEWS_CATEGORIES=news
 ```
 
+For local Docker deployment, JSON-output setup, and a connectivity test, see
+[`docs/searxng.md`](docs/searxng.md).
+
 For a more stable all-web search API, use Brave Search:
 
 ```bash
@@ -201,6 +251,44 @@ To use Zhihu's official search API:
 ```bash
 MEMEAGENT_SEARCH_PROVIDER=zhihu
 MEMEAGENT_ZHIHU_API_KEY=your_zhihu_access_secret
+```
+
+To use Qwen/DashScope's built-in model search as the MemeAgent retrieval
+provider:
+
+```bash
+MEMEAGENT_SEARCH_PROVIDER=qwen
+DASHSCOPE_API_KEY=your_dashscope_api_key
+MEMEAGENT_QWEN_SEARCH_MODEL=qwen-plus
+MEMEAGENT_QWEN_SEARCH_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+```
+
+This calls the OpenAI-compatible chat endpoint with `enable_search=true`.
+When DashScope returns source/citation metadata, MemeAgent normalizes it as
+search results; otherwise it uses the searched model answer as a cited retrieval
+summary.
+
+To use GLM/Zhipu's web search API:
+
+```bash
+MEMEAGENT_SEARCH_PROVIDER=glm
+ZAI_API_KEY=your_zai_api_key
+MEMEAGENT_GLM_SEARCH_ENGINE=search_pro
+MEMEAGENT_GLM_SEARCH_RECENCY_FILTER=noLimit
+MEMEAGENT_GLM_SEARCH_CONTENT_SIZE=medium
+```
+
+Optional GLM domain filtering:
+
+```bash
+MEMEAGENT_GLM_SEARCH_DOMAIN_FILTER=www.sohu.com
+```
+
+The GLM search provider uses the `zhipuai` Python package. Install it if you
+select `MEMEAGENT_SEARCH_PROVIDER=glm`:
+
+```bash
+pip install zhipuai
 ```
 
 If the selected search API needs a local HTTP proxy, set:

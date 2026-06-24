@@ -21,6 +21,7 @@ dependencies = [
 [project.scripts]
 memeagent = "main:main"
 meme = "main:main"
+meme-retrieve = "memeagent.retrieve_cli:main"
 
 [tool.setuptools]
 py-modules = ["main"]

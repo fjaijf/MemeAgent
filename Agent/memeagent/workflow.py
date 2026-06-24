@@ -45,10 +45,12 @@ class MemeResearchWorkflow:
         self,
         meme_agent: MemeAgent,
         search_agent: WebSearchAgent,
+        controller_agent: MemeAgent | None = None,
         memory_store: MemeMemoryStore | None = None,
         memory_recall_limit: int = 3,
     ) -> None:
         self.meme_agent = meme_agent
+        self.controller_agent = controller_agent or meme_agent
         self.search_agent = search_agent
         self.memory_store = memory_store
         self.memory_recall_limit = memory_recall_limit
@@ -170,7 +172,7 @@ class MemeResearchWorkflow:
                 "Force search enabled; planning retrieval queries.",
             )
             try:
-                retrieval_plan = self.meme_agent.plan_retrieval(
+                retrieval_plan = self.controller_agent.plan_retrieval(
                     topic=topic,
                     context=context,
                     visual_report=visual_report,
@@ -186,7 +188,7 @@ class MemeResearchWorkflow:
             "Deciding whether external retrieval is needed.",
         )
         try:
-            retrieval_plan = self.meme_agent.decide_retrieval(
+            retrieval_plan = self.controller_agent.decide_retrieval(
                 topic=topic,
                 context=context,
                 visual_report=visual_report,
@@ -248,7 +250,7 @@ class MemeResearchWorkflow:
                 f"Reflecting on retrieval round {reflection_round}.",
             )
             try:
-                reflection = self.meme_agent.reflect_retrieval(
+                reflection = self.controller_agent.reflect_retrieval(
                     topic=topic,
                     context=context,
                     visual_report=visual_report,

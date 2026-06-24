@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import sys
 from typing import Any
 
 try:
@@ -38,6 +39,7 @@ class MemeAgentCLI:
     """Terminal presentation helpers with a plain-text fallback."""
 
     def __init__(self, enabled: bool = True, stream_markdown: bool = False) -> None:
+        self._configure_text_streams()
         self.enabled = enabled and Console is not None
         self.stream_markdown = stream_markdown and self.enabled
         self.console = Console() if self.enabled else None
@@ -46,6 +48,16 @@ class MemeAgentCLI:
         self._task_id: Any = None
         self._stream_live: Any = None
         self._stream_text = ""
+
+    def _configure_text_streams(self) -> None:
+        for stream in (sys.stdout, sys.stderr):
+            reconfigure = getattr(stream, "reconfigure", None)
+            if not callable(reconfigure):
+                continue
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                continue
 
     def print_start(self, summary: RunSummary) -> None:
         if not self.enabled:

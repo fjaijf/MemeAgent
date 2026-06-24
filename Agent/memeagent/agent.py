@@ -98,8 +98,8 @@ Return these sections:
 4. Visual description: describe layout, expressions, gestures, colors, edits, screenshots, and meme composition.
 5. Meme template or cultural references: identify possible meme templates, named figures, events, slogans, fandoms, communities, or platform conventions.
 6. Harm/sentiment cues: list visible cues related to hostility, stereotyping, misinformation, persuasion, mobilization, irony, satire, fear, anger, ridicule, or ambiguity.
-7. Search keywords: provide 8-20 concise keywords or phrases in both Chinese and English when useful. Put each high-value search phrase in double quotes. Include exact OCR phrases, likely meme names, named people, background/event terms, locations, organizations, and visual entities.
-8. Suggested retrieval queries: provide 5-8 short web/news queries. Include queries that combine the meme/topic with any specific person, background, event, or OCR phrase found in the image.
+7. Search keywords: provide 8-20 concise keywords or phrases in both Chinese and English when useful. Put each high-value search phrase in double quotes. Include exact OCR phrases, named people, background/event terms, locations, organizations, fictional characters, media titles, and visual entities.
+8. Suggested retrieval queries: provide 5-8 short web/news queries. Each query should contain 1-3 concrete searchable elements from the image, such as an OCR phrase, character name, show/movie title, public figure, event, location, or visible object. Do not add generic words like "meme", "memes", "meme template", "template", "Chinese text", "表情包", or "梗图" unless they are part of an official title or exact visible OCR.
 
 Be descriptive rather than interpretive. If something is uncertain, mark it as uncertain.
 """.strip()
