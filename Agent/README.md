@@ -80,6 +80,31 @@ MEMEAGENT_CONTROLLER_THINKING=true
 ZAI_API_KEY=your_zai_api_key
 ```
 
+To run the agent with locally deployed Hugging Face models while keeping the
+remote GLM/Qwen API configuration available, set the main multimodal model and
+controller model separately:
+
+```bash
+MEMEAGENT_PROVIDER=local-transformers
+MEMEAGENT_MODEL=/data/ggbond/Qwen3.6-27B
+MEMEAGENT_LOCAL_THINKING=false
+MEMEAGENT_LOCAL_STRIP_THINKING=true
+MEMEAGENT_LOCAL_MAX_NEW_TOKENS=2048
+
+MEMEAGENT_CONTROLLER_PROVIDER=local-transformers
+MEMEAGENT_CONTROLLER_MODEL=/data/ggbond/Qwen3-32B
+MEMEAGENT_CONTROLLER_THINKING=true
+```
+
+Local mode loads models through Hugging Face Transformers. Install the optional
+dependencies before using it:
+
+```bash
+pip install -e ".[local]"
+# or
+pip install -r requirements-local.txt
+```
+
 To allow MemeAgent to decide whether public web/news retrieval is needed:
 
 ```bash
@@ -199,51 +224,11 @@ MEMEAGENT_SEARCH_PROVIDER=ddgs,zhihu
 MEMEAGENT_ZHIHU_API_KEY=your_zhihu_access_secret
 ```
 
-To use Google results through `googlesearch-python`:
-
-```bash
-MEMEAGENT_SEARCH_PROVIDER=google
-```
-
-To use a self-hosted SearXNG instance:
-
-```bash
-MEMEAGENT_SEARCH_PROVIDER=searxng
-MEMEAGENT_SEARXNG_URL=http://localhost:8888
-```
-
-The SearXNG instance must allow JSON output, for example:
-
-```yaml
-search:
-  formats:
-    - html
-    - json
-```
-
-Optional SearXNG tuning:
-
-```bash
-MEMEAGENT_SEARXNG_ENGINES=google,bing,brave
-MEMEAGENT_SEARXNG_WEB_CATEGORIES=general
-MEMEAGENT_SEARXNG_NEWS_CATEGORIES=news
-```
-
-For local Docker deployment, JSON-output setup, and a connectivity test, see
-[`docs/searxng.md`](docs/searxng.md).
-
-For a more stable all-web search API, use Brave Search:
-
-```bash
-MEMEAGENT_SEARCH_PROVIDER=brave
-MEMEAGENT_SEARCH_API_KEY=your_brave_search_api_key
-```
-
-Or use Tavily, which is designed for agent/RAG search workflows:
+To use Tavily, which is designed for agent/RAG search workflows:
 
 ```bash
 MEMEAGENT_SEARCH_PROVIDER=tavily
-MEMEAGENT_SEARCH_API_KEY=your_tavily_api_key
+MEMEAGENT_TAVILY_API_KEY=your_tavily_api_key
 ```
 
 To use Zhihu's official search API:

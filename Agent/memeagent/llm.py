@@ -1,14 +1,28 @@
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
+import io
 import os
+from pathlib import Path
+import re
 from typing import Any
+from urllib.parse import urlparse
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from openai import OpenAI
 import requests
 
 from .config import MemeAgentConfig
+
+
+_LOCAL_TRANSFORMERS_PROVIDERS = {
+    "local",
+    "local-transformers",
+    "transformers",
+    "hf",
+    "huggingface",
+}
 
 
 @dataclass(frozen=True)
@@ -174,6 +188,327 @@ class ZhipuAIChatClient:
         return str(content)
 
 
+class LocalTransformersChatClient:
+    """Local Hugging Face Transformers chat client with optional vision inputs."""
+
+    def __init__(
+        self,
+        *,
+        model_path: str,
+        temperature: float,
+        max_tokens: int | None,
+        timeout: float,
+        enable_thinking: bool | None = None,
+        strip_thinking: bool = True,
+    ) -> None:
+        self.model_path = str(Path(model_path).expanduser())
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.timeout = timeout
+        self.enable_thinking = enable_thinking
+        self.strip_thinking = strip_thinking
+        self.device_map = os.getenv("MEMEAGENT_LOCAL_DEVICE_MAP", "auto").strip() or "auto"
+        self.torch_dtype = os.getenv("MEMEAGENT_LOCAL_TORCH_DTYPE", "auto").strip() or "auto"
+        self.trust_remote_code = _env_flag("MEMEAGENT_LOCAL_TRUST_REMOTE_CODE", True)
+        self.default_max_new_tokens = int(
+            os.getenv("MEMEAGENT_LOCAL_MAX_NEW_TOKENS", "2048").strip() or "2048"
+        )
+        self.top_p = _env_optional_float("MEMEAGENT_LOCAL_TOP_P")
+        self.top_k = _env_optional_int("MEMEAGENT_LOCAL_TOP_K")
+        self.min_p = _env_optional_float("MEMEAGENT_LOCAL_MIN_P")
+
+        self._torch: Any | None = None
+        self._model: Any | None = None
+        self._tokenizer: Any | None = None
+        self._processor: Any | None = None
+        self._is_multimodal = False
+
+    def invoke(self, messages: list[Any]) -> ChatResponse:
+        self._ensure_loaded()
+        hf_messages, images = self._convert_messages(
+            messages,
+            include_images=self._is_multimodal,
+        )
+        if self._is_multimodal:
+            return ChatResponse(content=self._invoke_multimodal(hf_messages, images))
+        return ChatResponse(content=self._invoke_text(hf_messages))
+
+    def stream(self, messages: list[Any]):
+        yield self.invoke(messages).content
+
+    def _ensure_loaded(self) -> None:
+        if self._model is not None:
+            return
+
+        try:
+            import torch
+            import transformers
+            from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor, AutoTokenizer
+        except (ImportError, ModuleNotFoundError) as exc:
+            raise RuntimeError(
+                "Local Transformers mode requires torch, transformers, accelerate, "
+                "and pillow. Install the local extras, for example: "
+                "pip install -e .[local]"
+            ) from exc
+
+        if not Path(self.model_path).exists():
+            raise FileNotFoundError(f"Local model path does not exist: {self.model_path}")
+
+        config = AutoConfig.from_pretrained(
+            self.model_path,
+            trust_remote_code=self.trust_remote_code,
+        )
+        self._is_multimodal = bool(
+            getattr(config, "vision_config", None)
+            or getattr(config, "image_token_id", None) is not None
+            or getattr(config, "language_model_only", True) is False
+        )
+
+        model_kwargs: dict[str, Any] = {
+            "device_map": self.device_map,
+            "trust_remote_code": self.trust_remote_code,
+        }
+        if self.torch_dtype:
+            model_kwargs["torch_dtype"] = self.torch_dtype
+
+        if self._is_multimodal:
+            model_cls = (
+                getattr(transformers, "AutoModelForImageTextToText", None)
+                or getattr(transformers, "AutoModelForVision2Seq", None)
+                or AutoModelForCausalLM
+            )
+            self._processor = AutoProcessor.from_pretrained(
+                self.model_path,
+                trust_remote_code=self.trust_remote_code,
+            )
+            self._tokenizer = getattr(self._processor, "tokenizer", None)
+        else:
+            model_cls = AutoModelForCausalLM
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                self.model_path,
+                trust_remote_code=self.trust_remote_code,
+            )
+
+        self._model = model_cls.from_pretrained(self.model_path, **model_kwargs)
+        self._model.eval()
+        self._torch = torch
+
+    def _invoke_text(self, messages: list[dict[str, Any]]) -> str:
+        if self._model is None or self._tokenizer is None or self._torch is None:
+            raise RuntimeError("Local text model is not loaded.")
+
+        prompt = self._apply_chat_template(self._tokenizer, messages)
+        inputs = self._tokenizer([prompt], return_tensors="pt").to(self._model.device)
+        generated_ids = self._generate(inputs)
+        output_ids = generated_ids[0][inputs.input_ids.shape[-1] :]
+        content = self._tokenizer.decode(output_ids, skip_special_tokens=True).strip()
+        return self._postprocess_content(content)
+
+    def _invoke_multimodal(
+        self,
+        messages: list[dict[str, Any]],
+        images: list[Any],
+    ) -> str:
+        if self._model is None or self._processor is None or self._torch is None:
+            raise RuntimeError("Local multimodal model is not loaded.")
+
+        prompt = self._apply_chat_template(self._processor, messages)
+        processor_kwargs: dict[str, Any] = {
+            "text": [prompt],
+            "return_tensors": "pt",
+        }
+        if images:
+            processor_kwargs["images"] = images
+        inputs = self._processor(**processor_kwargs).to(self._model.device)
+        generated_ids = self._generate(inputs)
+        output_ids = generated_ids[0][inputs["input_ids"].shape[-1] :]
+
+        decoder = getattr(self._processor, "decode", None)
+        if decoder is None:
+            decoder = self._processor.tokenizer.decode
+        content = decoder(output_ids, skip_special_tokens=True).strip()
+        return self._postprocess_content(content)
+
+    def _generate(self, inputs: Any) -> Any:
+        if self._model is None or self._torch is None:
+            raise RuntimeError("Local model is not loaded.")
+
+        generation_kwargs: dict[str, Any] = {
+            "max_new_tokens": self.max_tokens or self.default_max_new_tokens,
+        }
+        if self.temperature > 0:
+            generation_kwargs["do_sample"] = True
+            generation_kwargs["temperature"] = self.temperature
+            if self.top_p is not None:
+                generation_kwargs["top_p"] = self.top_p
+            if self.top_k is not None:
+                generation_kwargs["top_k"] = self.top_k
+            if self.min_p is not None:
+                generation_kwargs["min_p"] = self.min_p
+        else:
+            generation_kwargs["do_sample"] = False
+
+        tokenizer = self._tokenizer or getattr(self._processor, "tokenizer", None)
+        if tokenizer is not None and getattr(tokenizer, "pad_token_id", None) is None:
+            eos_token_id = getattr(tokenizer, "eos_token_id", None)
+            if eos_token_id is not None:
+                generation_kwargs["pad_token_id"] = eos_token_id
+
+        with self._torch.inference_mode():
+            return self._model.generate(**inputs, **generation_kwargs)
+
+    def _apply_chat_template(self, template_owner: Any, messages: list[dict[str, Any]]) -> str:
+        apply_chat_template = getattr(template_owner, "apply_chat_template", None)
+        if apply_chat_template is None:
+            return self._fallback_prompt(messages)
+
+        kwargs: dict[str, Any] = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+        }
+        if self.enable_thinking is not None:
+            kwargs["enable_thinking"] = self.enable_thinking
+
+        try:
+            prompt = apply_chat_template(messages, **kwargs)
+        except TypeError:
+            kwargs.pop("enable_thinking", None)
+            prompt = apply_chat_template(messages, **kwargs)
+        return str(prompt)
+
+    def _fallback_prompt(self, messages: list[dict[str, Any]]) -> str:
+        rendered: list[str] = []
+        for message in messages:
+            role = message.get("role", "user")
+            content = self._text_only_content(message.get("content", ""))
+            rendered.append(f"{role}: {content}")
+        rendered.append("assistant:")
+        return "\n".join(rendered)
+
+    def _convert_messages(
+        self,
+        messages: list[Any],
+        *,
+        include_images: bool,
+    ) -> tuple[list[dict[str, Any]], list[Any]]:
+        hf_messages: list[dict[str, Any]] = []
+        images: list[Any] = []
+        for message in messages:
+            role = getattr(message, "type", None) or getattr(message, "role", "user")
+            if role == "human":
+                role = "user"
+            elif role == "ai":
+                role = "assistant"
+
+            content = getattr(message, "content", message)
+            converted_content = self._convert_content(
+                content,
+                include_images=include_images and role != "system",
+                images=images,
+            )
+            hf_messages.append({"role": role, "content": converted_content})
+        return hf_messages, images
+
+    def _convert_content(
+        self,
+        content: Any,
+        *,
+        include_images: bool,
+        images: list[Any],
+    ) -> str | list[dict[str, Any]]:
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return str(content)
+
+        blocks: list[dict[str, Any]] = []
+        text_parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                text_parts.append(item)
+                blocks.append({"type": "text", "text": item})
+                continue
+            if not isinstance(item, dict):
+                text = str(item)
+                text_parts.append(text)
+                blocks.append({"type": "text", "text": text})
+                continue
+
+            item_type = item.get("type")
+            if item_type == "text" or "text" in item:
+                text = str(item.get("text", ""))
+                text_parts.append(text)
+                blocks.append({"type": "text", "text": text})
+                continue
+            if item_type == "image_url" or "image_url" in item:
+                if include_images:
+                    image = self._load_image_from_image_url(item.get("image_url"))
+                    images.append(image)
+                    blocks.append({"type": "image", "image": image})
+                continue
+            if item_type == "image" or "image" in item:
+                if include_images:
+                    image = self._load_image(item.get("image"))
+                    images.append(image)
+                    blocks.append({"type": "image", "image": image})
+                continue
+
+        if include_images and blocks:
+            return blocks
+        return "\n".join(part for part in text_parts if part)
+
+    def _load_image_from_image_url(self, image_url: Any) -> Any:
+        if isinstance(image_url, dict):
+            return self._load_image(image_url.get("url"))
+        return self._load_image(image_url)
+
+    def _load_image(self, image_ref: Any) -> Any:
+        if image_ref is None:
+            raise ValueError("Image block is missing a URL or path.")
+
+        try:
+            from PIL import Image
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "Local multimodal mode requires pillow to load image inputs."
+            ) from exc
+
+        if isinstance(image_ref, Image.Image):
+            return image_ref.convert("RGB")
+
+        image_value = str(image_ref)
+        if image_value.startswith("data:"):
+            _, encoded = image_value.split(",", 1)
+            return Image.open(io.BytesIO(base64.b64decode(encoded))).convert("RGB")
+        if image_value.startswith(("http://", "https://")):
+            response = requests.get(image_value, timeout=self.timeout)
+            response.raise_for_status()
+            return Image.open(io.BytesIO(response.content)).convert("RGB")
+        if image_value.startswith("file://"):
+            path = Path(urlparse(image_value).path)
+        else:
+            path = Path(image_value).expanduser()
+        return Image.open(path).convert("RGB")
+
+    def _text_only_content(self, content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict) and (item.get("type") == "text" or "text" in item):
+                    parts.append(str(item.get("text", "")))
+            return "\n".join(part for part in parts if part)
+        return str(content)
+
+    def _postprocess_content(self, content: str) -> str:
+        if self.strip_thinking:
+            content = re.sub(r"(?s)<think>.*?</think>\s*", "", content)
+        return content.strip()
+
+
 def _openai_api_key() -> str:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key or api_key == "your_api_key_here":
@@ -202,6 +537,16 @@ def _zai_api_key() -> str:
 def create_llm(config: MemeAgentConfig) -> Any:
     """Create the primary model client used for vision and final analysis."""
 
+    if config.provider in _LOCAL_TRANSFORMERS_PROVIDERS:
+        return LocalTransformersChatClient(
+            model_path=config.model,
+            temperature=config.temperature,
+            max_tokens=config.max_tokens,
+            timeout=config.timeout,
+            enable_thinking=_env_optional_flag("MEMEAGENT_LOCAL_THINKING", False),
+            strip_thinking=_env_flag("MEMEAGENT_LOCAL_STRIP_THINKING", True),
+        )
+
     if config.provider in {"openai", "openai-compatible"}:
         return OpenAICompatibleChatClient(config=config, api_key=_openai_api_key())
 
@@ -225,6 +570,16 @@ def create_controller_llm(config: MemeAgentConfig) -> Any | None:
     if not provider:
         return None
 
+    if provider in _LOCAL_TRANSFORMERS_PROVIDERS:
+        return LocalTransformersChatClient(
+            model_path=config.controller_model,
+            temperature=config.controller_temperature,
+            max_tokens=config.controller_max_tokens,
+            timeout=config.controller_timeout,
+            enable_thinking=config.controller_thinking_enabled,
+            strip_thinking=_env_flag("MEMEAGENT_LOCAL_STRIP_THINKING", True),
+        )
+
     if provider in {"openai", "openai-compatible"}:
         return OpenAICompatibleChatClient(
             config=config,
@@ -247,3 +602,27 @@ def create_controller_llm(config: MemeAgentConfig) -> Any | None:
         )
 
     raise ValueError(f"Unsupported controller provider: {provider}")
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off", "disabled"}
+
+
+def _env_optional_flag(name: str, default: bool | None = None) -> bool | None:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off", "disabled"}
+
+
+def _env_optional_float(name: str) -> float | None:
+    value = os.getenv(name, "").strip()
+    return float(value) if value else None
+
+
+def _env_optional_int(name: str) -> int | None:
+    value = os.getenv(name, "").strip()
+    return int(value) if value else None

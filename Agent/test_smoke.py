@@ -4,10 +4,9 @@ import argparse
 from pathlib import Path
 import sys
 
-from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage
 
-from memeagent.config import MemeAgentConfig
+from memeagent.config import MemeAgentConfig, load_project_env
 from memeagent.llm import create_llm
 from memeagent.search_agent import SearchAgentConfig, WebSearchAgent
 
@@ -46,6 +45,7 @@ def test_search(config: MemeAgentConfig, query: str) -> None:
         SearchAgentConfig(
             search_provider=config.search_provider,
             search_api_key=config.search_api_key,
+            tavily_api_key=config.tavily_api_key,
             zhihu_api_key=config.zhihu_api_key,
             search_proxy=config.search_proxy,
             search_max_results=min(config.search_max_results, 2),
@@ -84,7 +84,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     project_root = Path(__file__).resolve().parent
-    load_dotenv(project_root / ".env")
+    load_project_env(project_root)
     args = parse_args()
     config = MemeAgentConfig.from_env()
 

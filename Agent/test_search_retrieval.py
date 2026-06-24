@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import time
 import unittest
-from urllib.parse import parse_qs, urlparse
 
 import memeagent.search_agent as search_agent_module
 from memeagent.search_agent import SearchAgentConfig, WebSearchAgent
@@ -142,51 +141,16 @@ class SearchRetrievalTests(unittest.TestCase):
         self.assertEqual(reddit_type, "post_or_comment_context_candidate")
         self.assertEqual(x_type, "social_post_candidate")
 
-    def test_google_search_results_are_normalized(self) -> None:
-        class FakeGoogleResult:
-            title = "This Is Fine"
-            url = "https://example.com/this-is-fine"
-            description = "A result snippet from Google."
+    def test_removed_search_providers_are_not_supported(self) -> None:
+        agent = WebSearchAgent(SearchAgentConfig(cache_enabled=False))
 
-        calls: list[tuple[str, dict[str, object]]] = []
+        for provider in ("google", "googlesearch", "searxng", "brave"):
+            with self.subTest(provider=provider):
+                with self.assertRaisesRegex(ValueError, "Unsupported search provider"):
+                    agent._search_text_provider_uncached(provider, "this is fine")
 
-        def fake_google_search(query: str, **kwargs: object) -> list[FakeGoogleResult]:
-            calls.append((query, kwargs))
-            return [FakeGoogleResult()]
-
-        original_google_search = search_agent_module.google_search
-        search_agent_module.google_search = fake_google_search
-        try:
-            agent = WebSearchAgent(
-                SearchAgentConfig(
-                    search_provider="google",
-                    search_max_results=3,
-                    search_lang="zh-cn",
-                    search_country="cn",
-                    cache_enabled=False,
-                )
-            )
-
-            results = agent._search_text_provider_uncached("google", "this is fine")
-        finally:
-            search_agent_module.google_search = original_google_search
-
-        self.assertEqual(1, len(results))
-        self.assertEqual("this is fine", calls[0][0])
-        self.assertEqual(3, calls[0][1]["num_results"])
-        self.assertEqual("zh", calls[0][1]["lang"])
-        self.assertEqual("cn", calls[0][1]["region"])
-        self.assertTrue(calls[0][1]["advanced"])
-        self.assertEqual("This Is Fine", results[0]["title"])
-        self.assertEqual("A result snippet from Google.", results[0]["body"])
-        self.assertEqual("https://example.com/this-is-fine", results[0]["href"])
-        self.assertEqual("Google", results[0]["source"])
-
-    def test_searxng_search_results_are_requested_and_normalized(self) -> None:
+    def test_tavily_search_uses_dedicated_api_key(self) -> None:
         class FakeResponse:
-            def __init__(self, payload: dict[str, object]) -> None:
-                self.payload = payload
-
             def __enter__(self) -> "FakeResponse":
                 return self
 
@@ -194,83 +158,21 @@ class SearchRetrievalTests(unittest.TestCase):
                 return None
 
             def read(self) -> bytes:
-                return json.dumps(self.payload).encode("utf-8")
-
-        class FakeSearxngAgent(WebSearchAgent):
-            def __init__(self, config: SearchAgentConfig) -> None:
-                super().__init__(config)
-                self.requests: list[object] = []
-
-            def _open_url(self, req: object, data: bytes | None = None) -> FakeResponse:
-                self.requests.append(req)
-                return FakeResponse(
+                return json.dumps(
                     {
                         "results": [
                             {
-                                "title": "This Is Fine",
-                                "content": "A SearXNG result snippet.",
-                                "url": "https://example.com/this-is-fine",
-                                "engines": ["google", "bing"],
-                                "publishedDate": "2026-01-01",
-                            },
-                            {
-                                "title": "Second Result",
-                                "content": "Should be trimmed by max_results.",
-                                "url": "https://example.com/second",
-                            },
+                                "title": "Tavily result",
+                                "content": "Tavily snippet.",
+                                "url": "https://example.com/tavily",
+                                "source": "Example",
+                                "published_date": "2026-01-01",
+                            }
                         ]
                     }
-                )
+                ).encode("utf-8")
 
-        agent = FakeSearxngAgent(
-            SearchAgentConfig(
-                search_provider="searxng",
-                searxng_url="http://searx.local",
-                searxng_engines="google,bing",
-                searxng_web_categories="general",
-                searxng_news_categories="news",
-                search_lang="zh-CN",
-                search_max_results=1,
-                news_max_results=1,
-                cache_enabled=False,
-            )
-        )
-
-        web_results = agent._search_text_provider_uncached("searxng", "this is fine")
-        news_results = agent._search_news_provider_uncached("searxng", "this is fine")
-
-        web_url = urlparse(agent.requests[0].full_url)
-        web_params = parse_qs(web_url.query)
-        news_url = urlparse(agent.requests[1].full_url)
-        news_params = parse_qs(news_url.query)
-
-        self.assertEqual("/search", web_url.path)
-        self.assertEqual(["this is fine"], web_params["q"])
-        self.assertEqual(["json"], web_params["format"])
-        self.assertEqual(["general"], web_params["categories"])
-        self.assertEqual(["zh-CN"], web_params["language"])
-        self.assertEqual(["google,bing"], web_params["engines"])
-        self.assertEqual(["news"], news_params["categories"])
-        self.assertEqual(1, len(web_results))
-        self.assertEqual(1, len(news_results))
-        self.assertEqual("This Is Fine", web_results[0]["title"])
-        self.assertEqual("A SearXNG result snippet.", web_results[0]["body"])
-        self.assertEqual("https://example.com/this-is-fine", web_results[0]["href"])
-        self.assertEqual("google, bing", web_results[0]["source"])
-        self.assertEqual("2026-01-01", web_results[0]["date"])
-
-    def test_searxng_url_preserves_base_path_and_query_params(self) -> None:
-        class FakeResponse:
-            def __enter__(self) -> "FakeResponse":
-                return self
-
-            def __exit__(self, *args: object) -> None:
-                return None
-
-            def read(self) -> bytes:
-                return json.dumps({"results": []}).encode("utf-8")
-
-        class FakeSearxngAgent(WebSearchAgent):
+        class FakeTavilyAgent(WebSearchAgent):
             def __init__(self, config: SearchAgentConfig) -> None:
                 super().__init__(config)
                 self.requests: list[object] = []
@@ -279,23 +181,22 @@ class SearchRetrievalTests(unittest.TestCase):
                 self.requests.append(req)
                 return FakeResponse()
 
-        agent = FakeSearxngAgent(
+        agent = FakeTavilyAgent(
             SearchAgentConfig(
-                search_provider="searxng",
-                searxng_url="http://localhost:8888/searxng?theme=simple",
+                search_provider="tavily",
+                tavily_api_key="tavily-key",
                 cache_enabled=False,
             )
         )
 
-        agent._search_text_provider_uncached("searxng", "this is fine")
+        results = agent._search_text_provider_uncached("tavily", "this is fine")
+        headers = dict(agent.requests[0].header_items())
 
-        request_url = urlparse(agent.requests[0].full_url)
-        params = parse_qs(request_url.query)
-
-        self.assertEqual("/searxng/search", request_url.path)
-        self.assertEqual(["simple"], params["theme"])
-        self.assertEqual(["this is fine"], params["q"])
-        self.assertEqual(["json"], params["format"])
+        self.assertEqual("Bearer tavily-key", headers["Authorization"])
+        self.assertEqual(1, len(results))
+        self.assertEqual("Tavily result", results[0]["title"])
+        self.assertEqual("Tavily snippet.", results[0]["body"])
+        self.assertEqual("https://example.com/tavily", results[0]["href"])
 
     def test_zhihu_payload_shape_is_extracted_and_normalized(self) -> None:
         agent = WebSearchAgent(SearchAgentConfig(cache_enabled=False))
@@ -426,6 +327,46 @@ class SearchRetrievalTests(unittest.TestCase):
         self.assertEqual("2025-04-01", results[0]["date"])
         self.assertEqual("search_pro", fake_web_search.calls[0]["search_engine"])
         self.assertEqual("www.sohu.com", fake_web_search.calls[0]["search_domain_filter"])
+
+    def test_glm_pydantic_style_payload_is_normalized_without_model_dump(self) -> None:
+        class FakeSearchResult:
+            model_fields = {
+                "title": object(),
+                "content": object(),
+                "url": object(),
+                "media": object(),
+                "publish_time": object(),
+            }
+
+            def __init__(self) -> None:
+                self.title = "财经新闻"
+                self.content = "新闻摘要"
+                self.url = "https://example.com/news"
+                self.media = "Example News"
+                self.publish_time = "2025-04-01"
+
+            def model_dump(self) -> dict[str, object]:
+                raise AssertionError("model_dump should not be used for this payload")
+
+        class FakeSearchResponse:
+            model_fields = {"search_result": object()}
+
+            def __init__(self) -> None:
+                self.search_result = [FakeSearchResult()]
+
+            def model_dump(self) -> dict[str, object]:
+                raise AssertionError("model_dump should not be used for this payload")
+
+        agent = WebSearchAgent(SearchAgentConfig(cache_enabled=False))
+
+        results = agent._normalize_glm_payload(FakeSearchResponse(), max_results=5)
+
+        self.assertEqual(1, len(results))
+        self.assertEqual("财经新闻", results[0]["title"])
+        self.assertEqual("新闻摘要", results[0]["body"])
+        self.assertEqual("https://example.com/news", results[0]["href"])
+        self.assertEqual("Example News", results[0]["source"])
+        self.assertEqual("2025-04-01", results[0]["date"])
 
     def test_run_with_timeout_returns_after_configured_timeout(self) -> None:
         agent = WebSearchAgent(

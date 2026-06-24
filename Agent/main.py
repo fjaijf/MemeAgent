@@ -4,11 +4,9 @@ import argparse
 from dataclasses import replace
 from pathlib import Path
 
-from dotenv import load_dotenv
-
 from memeagent.agent import MemeAgent
 from memeagent.cli_ui import MemeAgentCLI, RunSummary
-from memeagent.config import MemeAgentConfig
+from memeagent.config import MemeAgentConfig, load_project_env
 from memeagent.heads import HEADS
 from memeagent.llm import create_controller_llm, create_llm
 from memeagent.memory import MemeMemoryStore
@@ -65,12 +63,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--search-provider",
         default=None,
-        help="Override search provider. Supported values include ddgs, google, searxng, brave, tavily, zhihu, qwen, glm, or comma-separated combinations.",
+        help="Override search provider. Supported values include ddgs, tavily, zhihu, qwen, glm, or comma-separated combinations.",
     )
     parser.add_argument(
         "--search-api-key",
         default=None,
-        help="Override search API key for providers such as Brave or Tavily.",
+        help="Override search API key for providers such as Tavily.",
+    )
+    parser.add_argument(
+        "--tavily-api-key",
+        default=None,
+        help="Override Tavily search API key.",
     )
     parser.add_argument(
         "--zhihu-api-key",
@@ -96,26 +99,6 @@ def parse_args() -> argparse.Namespace:
         "--glm-search-domain-filter",
         default=None,
         help="Restrict GLM web search to one domain, for example www.sohu.com.",
-    )
-    parser.add_argument(
-        "--searxng-url",
-        default=None,
-        help="Override SearXNG base URL, for example http://localhost:8888.",
-    )
-    parser.add_argument(
-        "--searxng-engines",
-        default=None,
-        help="Override comma-separated SearXNG engines, for example google,bing.",
-    )
-    parser.add_argument(
-        "--searxng-web-categories",
-        default=None,
-        help="Override SearXNG web search categories. Default: general.",
-    )
-    parser.add_argument(
-        "--searxng-news-categories",
-        default=None,
-        help="Override SearXNG news search categories. Default: news.",
     )
     parser.add_argument(
         "--search-proxy",
@@ -216,7 +199,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     project_root = Path(__file__).resolve().parent
-    load_dotenv(project_root / ".env")
+    load_project_env(project_root)
     args = parse_args()
     search_requested = args.search or args.force_search
 
@@ -233,6 +216,8 @@ def main() -> None:
         search_overrides["search_provider"] = args.search_provider.strip()
     if args.search_api_key is not None:
         search_overrides["search_api_key"] = args.search_api_key.strip() or None
+    if args.tavily_api_key is not None:
+        search_overrides["tavily_api_key"] = args.tavily_api_key.strip() or None
     if args.zhihu_api_key is not None:
         search_overrides["zhihu_api_key"] = args.zhihu_api_key.strip() or None
     if args.qwen_search_model is not None:
@@ -245,14 +230,6 @@ def main() -> None:
         search_overrides["glm_search_domain_filter"] = (
             args.glm_search_domain_filter.strip() or None
         )
-    if args.searxng_url is not None:
-        search_overrides["searxng_url"] = args.searxng_url.strip()
-    if args.searxng_engines is not None:
-        search_overrides["searxng_engines"] = args.searxng_engines.strip() or None
-    if args.searxng_web_categories is not None:
-        search_overrides["searxng_web_categories"] = args.searxng_web_categories.strip()
-    if args.searxng_news_categories is not None:
-        search_overrides["searxng_news_categories"] = args.searxng_news_categories.strip()
     if args.search_proxy is not None:
         search_overrides["search_proxy"] = args.search_proxy.strip() or None
     if args.search_max_results is not None:
@@ -301,6 +278,7 @@ def main() -> None:
         SearchAgentConfig(
             search_provider=config.search_provider,
             search_api_key=config.search_api_key,
+            tavily_api_key=config.tavily_api_key,
             zhihu_api_key=config.zhihu_api_key,
             qwen_search_api_key=config.qwen_search_api_key,
             qwen_search_base_url=config.qwen_search_base_url,
@@ -311,10 +289,6 @@ def main() -> None:
             glm_search_content_size=config.glm_search_content_size,
             glm_search_domain_filter=config.glm_search_domain_filter,
             search_proxy=config.search_proxy,
-            searxng_url=config.searxng_url,
-            searxng_engines=config.searxng_engines,
-            searxng_web_categories=config.searxng_web_categories,
-            searxng_news_categories=config.searxng_news_categories,
             search_max_results=config.search_max_results,
             news_max_results=config.news_max_results,
             search_timeout=config.search_timeout,

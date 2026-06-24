@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 import hashlib
@@ -11,8 +12,7 @@ import re
 from threading import Lock, Thread
 import time
 from typing import Any
-from urllib.error import HTTPError
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import urlencode
 from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 import requests
@@ -21,11 +21,6 @@ try:
     from ddgs import DDGS
 except ImportError:
     from duckduckgo_search import DDGS
-
-try:
-    from googlesearch import search as google_search
-except ImportError:
-    google_search = None
 
 try:
     from zai import ZhipuAiClient as ZaiZhipuAiClient
@@ -44,12 +39,9 @@ from .cache import SearchResultCache
 
 logger = logging.getLogger(__name__)
 
-_BRAVE_WEB_API = "https://api.search.brave.com/res/v1/web/search"
-_BRAVE_NEWS_API = "https://api.search.brave.com/res/v1/news/search"
 _TAVILY_SEARCH_API = "https://api.tavily.com/search"
 _ZHIHU_SEARCH_API = "https://developer.zhihu.com/api/v1/content/zhihu_search"
 _QWEN_COMPATIBLE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-_SEARXNG_DEFAULT_URL = "http://localhost:8888"
 _SEARCH_PARALLEL_WORKERS = 8
 _DEFAULT_CONTEXT_SITES = (
     "reddit.com",
@@ -82,6 +74,7 @@ _GENERIC_RELEVANCE_TERMS = {
 class SearchAgentConfig:
     search_provider: str = "ddgs"
     search_api_key: str | None = None
+    tavily_api_key: str | None = None
     zhihu_api_key: str | None = None
     qwen_search_api_key: str | None = None
     qwen_search_base_url: str = _QWEN_COMPATIBLE_BASE_URL
@@ -92,10 +85,6 @@ class SearchAgentConfig:
     glm_search_content_size: str = "medium"
     glm_search_domain_filter: str | None = None
     search_proxy: str | None = None
-    searxng_url: str = _SEARXNG_DEFAULT_URL
-    searxng_engines: str | None = None
-    searxng_web_categories: str = "general"
-    searxng_news_categories: str = "news"
     search_max_results: int = 5
     news_max_results: int = 5
     search_timeout: float = 12.0
@@ -550,19 +539,6 @@ class WebSearchAgent:
     ) -> list[dict[str, Any]]:
         if provider == "ddgs":
             return self._search_ddgs_text(query)
-        if provider == "google":
-            return self._search_google_text(query)
-        if provider == "searxng":
-            return self._search_searxng(
-                query,
-                max_results=self.config.search_max_results,
-                categories=self.config.searxng_web_categories,
-            )
-        if provider == "brave":
-            return self._search_brave(
-                query,
-                max_results=self.config.search_max_results,
-            )
         if provider == "tavily":
             return self._search_tavily(
                 query,
@@ -586,7 +562,7 @@ class WebSearchAgent:
             )
         raise ValueError(
             f"Unsupported search provider '{provider}'. "
-            "Use ddgs, google, searxng, brave, tavily, zhihu, qwen, or glm."
+            "Use ddgs, tavily, zhihu, qwen, or glm."
         )
 
     def _search_news(self, query: str) -> list[dict[str, Any]]:
@@ -628,20 +604,6 @@ class WebSearchAgent:
     ) -> list[dict[str, Any]]:
         if provider == "ddgs":
             return self._search_ddgs_news(query)
-        if provider == "google":
-            return []
-        if provider == "searxng":
-            return self._search_searxng(
-                query,
-                max_results=self.config.news_max_results,
-                categories=self.config.searxng_news_categories,
-            )
-        if provider == "brave":
-            return self._search_brave(
-                query,
-                max_results=self.config.news_max_results,
-                news=True,
-            )
         if provider == "tavily":
             return self._search_tavily(
                 query,
@@ -664,7 +626,7 @@ class WebSearchAgent:
             )
         raise ValueError(
             f"Unsupported search provider '{provider}'. "
-            "Use ddgs, google, searxng, brave, tavily, zhihu, qwen, or glm."
+            "Use ddgs, tavily, zhihu, qwen, or glm."
         )
 
     def _cached_provider_search(
@@ -708,7 +670,7 @@ class WebSearchAgent:
 
     def _build_cache_key(self, kind: str, provider: str, query: str) -> str:
         payload = {
-            "version": 2,
+            "version": 3,
             "kind": kind,
             "provider": provider,
             "query": query,
@@ -718,10 +680,6 @@ class WebSearchAgent:
             "search_lang": self.config.search_lang,
             "search_context_sites": self.config.search_context_sites,
             "tavily_search_depth": self.config.tavily_search_depth,
-            "searxng_url": self.config.searxng_url,
-            "searxng_engines": self.config.searxng_engines,
-            "searxng_web_categories": self.config.searxng_web_categories,
-            "searxng_news_categories": self.config.searxng_news_categories,
             "qwen_search_base_url": self.config.qwen_search_base_url,
             "qwen_search_model": self.config.qwen_search_model,
             "glm_search_engine": self.config.glm_search_engine,
@@ -739,200 +697,6 @@ class WebSearchAgent:
     def _search_ddgs_news(self, query: str) -> list[dict[str, Any]]:
         with self._open_ddgs() as ddgs:
             return list(ddgs.news(query, max_results=self.config.news_max_results))
-
-    def _search_searxng(
-        self,
-        query: str,
-        max_results: int,
-        categories: str,
-    ) -> list[dict[str, Any]]:
-        params: dict[str, str] = {
-            "q": query,
-            "format": "json",
-            "language": self.config.search_lang,
-            "safesearch": "0",
-        }
-        categories = _clean_text(categories)
-        if categories:
-            params["categories"] = categories
-        engines = _clean_text(self.config.searxng_engines)
-        if engines:
-            params["engines"] = engines
-
-        endpoint, existing_params = self._searxng_endpoint_and_params()
-        existing_params.update(params)
-        req = Request(
-            f"{endpoint}?{urlencode(existing_params)}",
-            headers={
-                "Accept": "application/json",
-                "User-Agent": "MemeAgent/0.1",
-            },
-        )
-        try:
-            with self._open_url(req) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-        except HTTPError as exc:
-            if exc.code == 403:
-                raise ValueError(
-                    "SearXNG returned 403. Enable JSON output in the instance "
-                    "settings with search.formats including json."
-                ) from exc
-            raise
-        except json.JSONDecodeError as exc:
-            raise ValueError(
-                "SearXNG did not return JSON. Make sure MEMEAGENT_SEARXNG_URL "
-                "points to a SearXNG instance with format=json enabled."
-            ) from exc
-
-        raw_results = payload.get("results") if isinstance(payload, dict) else []
-        if not isinstance(raw_results, list):
-            return []
-
-        results: list[dict[str, Any]] = []
-        for item in raw_results:
-            if not isinstance(item, dict):
-                continue
-            normalized = self._normalize_searxng_item(item)
-            href = _clean_text(normalized.get("href"))
-            title = _clean_text(normalized.get("title"))
-            if href or title:
-                results.append(normalized)
-            if len(results) >= max_results:
-                break
-        return results
-
-    def _searxng_endpoint(self) -> str:
-        endpoint, _params = self._searxng_endpoint_and_params()
-        return endpoint
-
-    def _searxng_endpoint_and_params(self) -> tuple[str, dict[str, str]]:
-        base_url = _clean_text(self.config.searxng_url) or _SEARXNG_DEFAULT_URL
-        parts = urlsplit(base_url)
-        path = parts.path.rstrip("/")
-        if not path.endswith("/search"):
-            path = f"{path}/search" if path else "/search"
-        endpoint = urlunsplit((parts.scheme, parts.netloc, path, "", ""))
-        params = {
-            key: value
-            for key, value in parse_qsl(parts.query, keep_blank_values=False)
-            if key
-        }
-        return endpoint, params
-
-    def _normalize_searxng_item(self, item: dict[str, Any]) -> dict[str, Any]:
-        engines = item.get("engines")
-        if isinstance(engines, list):
-            engine_source = ", ".join(_clean_text(engine) for engine in engines)
-        else:
-            engine_source = _clean_text(engines)
-        source = (
-            _clean_text(item.get("engine"))
-            or engine_source
-            or _clean_text(item.get("source"))
-            or "SearXNG"
-        )
-
-        return {
-            "title": _clean_text(item.get("title")) or "SearXNG result",
-            "body": _clean_text(
-                item.get("content")
-                or item.get("description")
-                or item.get("snippet")
-                or item.get("summary")
-                or item.get("body")
-            ),
-            "href": _clean_text(item.get("url") or item.get("href") or item.get("link")),
-            "source": source,
-            "date": _clean_text(
-                item.get("publishedDate")
-                or item.get("published_date")
-                or item.get("pubdate")
-                or item.get("published")
-                or item.get("date")
-            ),
-            "thumbnail": _clean_text(item.get("thumbnail")),
-        }
-
-    def _search_google_text(self, query: str) -> list[dict[str, Any]]:
-        if google_search is None:
-            raise ValueError(
-                "googlesearch-python is required for Google search. "
-                "Install it with: pip install googlesearch-python"
-            )
-
-        base_kwargs: dict[str, Any] = {
-            "num_results": self.config.search_max_results,
-            "lang": self._google_search_lang(),
-            "advanced": True,
-            "unique": True,
-        }
-        if self.config.search_country:
-            base_kwargs["region"] = self.config.search_country.lower()
-        if self.config.search_proxy:
-            base_kwargs["proxy"] = self.config.search_proxy
-
-        candidate_kwargs = [
-            {**base_kwargs, "timeout": self.config.search_timeout},
-            base_kwargs,
-        ]
-        last_type_error: TypeError | None = None
-        for kwargs in candidate_kwargs:
-            try:
-                raw_results = list(google_search(query, **kwargs))
-                results: list[dict[str, Any]] = []
-                for item in raw_results:
-                    normalized = self._normalize_google_item(item)
-                    href = _clean_text(normalized.get("href"))
-                    title = _clean_text(normalized.get("title"))
-                    if href or title:
-                        results.append(normalized)
-                return results
-            except TypeError as exc:
-                last_type_error = exc
-
-        if last_type_error:
-            raise last_type_error
-        return []
-
-    def _google_search_lang(self) -> str:
-        lang = (self.config.search_lang or "en").strip().replace("_", "-")
-        return (lang.split("-", 1)[0] or "en").lower()
-
-    def _normalize_google_item(self, item: Any) -> dict[str, Any]:
-        if isinstance(item, str):
-            href = _clean_text(item)
-            return {
-                "title": href,
-                "body": "",
-                "href": href,
-                "source": "Google",
-            }
-
-        if isinstance(item, dict):
-            title = _clean_text(item.get("title"))
-            body = _clean_text(
-                item.get("description") or item.get("body") or item.get("snippet")
-            )
-            href = _clean_text(item.get("url") or item.get("href") or item.get("link"))
-        else:
-            title = _clean_text(getattr(item, "title", ""))
-            body = _clean_text(
-                getattr(item, "description", "")
-                or getattr(item, "body", "")
-                or getattr(item, "snippet", "")
-            )
-            href = _clean_text(
-                getattr(item, "url", "")
-                or getattr(item, "href", "")
-                or getattr(item, "link", "")
-            )
-
-        return {
-            "title": title or href or "Google result",
-            "body": body,
-            "href": href,
-            "source": "Google",
-        }
 
     def _open_ddgs(self):
         candidates: list[dict[str, Any]] = []
@@ -961,60 +725,23 @@ class WebSearchAgent:
 
         return DDGS()
 
-    def _search_brave(
-        self,
-        query: str,
-        max_results: int,
-        news: bool = False,
-    ) -> list[dict[str, Any]]:
-        if not self.config.search_api_key:
-            raise ValueError("MEMEAGENT_SEARCH_API_KEY is required for Brave search")
-
-        qs = urlencode(
-            {
-                "q": query,
-                "count": max_results,
-                "country": self.config.search_country,
-                "search_lang": self.config.search_lang,
-            }
-        )
-        endpoint = _BRAVE_NEWS_API if news else _BRAVE_WEB_API
-        req = Request(
-            f"{endpoint}?{qs}",
-            headers={
-                "Accept": "application/json",
-                "X-Subscription-Token": self.config.search_api_key,
-            },
-        )
-        with self._open_url(req) as resp:
-            payload = json.loads(resp.read())
-
-        raw_results = (
-            (payload.get("web") or {}).get("results")
-            or (payload.get("news") or {}).get("results")
-            or payload.get("results")
-            or []
-        )
-        return [
-            {
-                "title": item.get("title"),
-                "body": item.get("description") or item.get("snippet"),
-                "href": item.get("url"),
-                "source": item.get("source"),
-                "date": item.get("age") or item.get("page_age"),
-            }
-            for item in raw_results
-            if isinstance(item, dict)
-        ]
-
     def _search_tavily(
         self,
         query: str,
         max_results: int,
         topic: str,
     ) -> list[dict[str, Any]]:
-        if not self.config.search_api_key:
-            raise ValueError("MEMEAGENT_SEARCH_API_KEY is required for Tavily search")
+        api_key = (
+            self.config.tavily_api_key
+            or os.getenv("MEMEAGENT_TAVILY_API_KEY")
+            or os.getenv("TAVILY_API_KEY")
+            or self.config.search_api_key
+        )
+        if not api_key:
+            raise ValueError(
+                "MEMEAGENT_TAVILY_API_KEY, TAVILY_API_KEY, or "
+                "MEMEAGENT_SEARCH_API_KEY is required for Tavily search"
+            )
 
         data = json.dumps(
             {
@@ -1030,7 +757,7 @@ class WebSearchAgent:
             _TAVILY_SEARCH_API,
             data=data,
             headers={
-                "Authorization": f"Bearer {self.config.search_api_key}",
+                "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             },
             method="POST",
@@ -1301,6 +1028,9 @@ class WebSearchAgent:
             return [self._object_to_plain_data(item) for item in value]
         if isinstance(value, dict):
             return {key: self._object_to_plain_data(item) for key, item in value.items()}
+        pydantic_data = self._pydantic_model_to_plain_data(value)
+        if pydantic_data is not None:
+            return pydantic_data
         for method_name in ("model_dump", "dict", "to_dict"):
             method = getattr(value, method_name, None)
             if callable(method):
@@ -1309,8 +1039,45 @@ class WebSearchAgent:
                 except TypeError:
                     continue
         if hasattr(value, "__dict__"):
-            return self._object_to_plain_data(vars(value))
+            return {
+                key: self._object_to_plain_data(item)
+                for key, item in vars(value).items()
+                if isinstance(key, str) and not key.startswith("_")
+            }
         return value
+
+    def _pydantic_model_to_plain_data(self, value: Any) -> dict[str, Any] | None:
+        model_cls = type(value)
+        fields = getattr(model_cls, "model_fields", None)
+        if fields is None:
+            fields = getattr(model_cls, "__pydantic_fields__", None)
+        if fields is None:
+            fields = getattr(model_cls, "__fields__", None)
+        if not isinstance(fields, Mapping):
+            return None
+
+        data: dict[str, Any] = {}
+        for field_name in fields:
+            if not isinstance(field_name, str):
+                continue
+            try:
+                field_value = getattr(value, field_name)
+            except AttributeError:
+                continue
+            data[field_name] = self._object_to_plain_data(field_value)
+
+        for extra_attr in ("model_extra", "__pydantic_extra__"):
+            try:
+                extra = getattr(value, extra_attr, None)
+            except Exception:
+                continue
+            if not isinstance(extra, Mapping):
+                continue
+            for key, item in extra.items():
+                if isinstance(key, str) and key not in data:
+                    data[key] = self._object_to_plain_data(item)
+
+        return data
 
     def _normalize_vendor_search_item(
         self,

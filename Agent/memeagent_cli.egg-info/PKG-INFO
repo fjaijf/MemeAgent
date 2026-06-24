@@ -149,18 +149,11 @@ MEMEAGENT_SEARCH_PROVIDER=ddgs,zhihu
 MEMEAGENT_ZHIHU_API_KEY=your_zhihu_access_secret
 ```
 
-For a more stable all-web search API, use Brave Search:
-
-```bash
-MEMEAGENT_SEARCH_PROVIDER=brave
-MEMEAGENT_SEARCH_API_KEY=your_brave_search_api_key
-```
-
-Or use Tavily, which is designed for agent/RAG search workflows:
+To use Tavily, which is designed for agent/RAG search workflows:
 
 ```bash
 MEMEAGENT_SEARCH_PROVIDER=tavily
-MEMEAGENT_SEARCH_API_KEY=your_tavily_api_key
+MEMEAGENT_TAVILY_API_KEY=your_tavily_api_key
 ```
 
 To use Zhihu's official search API:

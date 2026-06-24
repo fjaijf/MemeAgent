@@ -11,11 +11,10 @@ from pathlib import Path
 from threading import local
 from typing import Any
 
-from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from memeagent.agent import MemeAgent, _normalize_content
-from memeagent.config import MemeAgentConfig
+from memeagent.config import MemeAgentConfig, load_project_env
 from memeagent.llm import create_controller_llm, create_llm
 from memeagent.memory import MemeMemoryStore
 from memeagent.search_agent import SearchAgentConfig, WebSearchAgent
@@ -431,6 +430,7 @@ def make_workflow(config: MemeAgentConfig, project_root: Path, disable_memory: b
             SearchAgentConfig(
                 search_provider=config.search_provider,
                 search_api_key=config.search_api_key,
+                tavily_api_key=config.tavily_api_key,
                 zhihu_api_key=config.zhihu_api_key,
                 qwen_search_api_key=config.qwen_search_api_key,
                 qwen_search_base_url=config.qwen_search_base_url,
@@ -441,10 +441,6 @@ def make_workflow(config: MemeAgentConfig, project_root: Path, disable_memory: b
                 glm_search_content_size=config.glm_search_content_size,
                 glm_search_domain_filter=config.glm_search_domain_filter,
                 search_proxy=config.search_proxy,
-                searxng_url=config.searxng_url,
-                searxng_engines=config.searxng_engines,
-                searxng_web_categories=config.searxng_web_categories,
-                searxng_news_categories=config.searxng_news_categories,
                 search_max_results=config.search_max_results,
                 news_max_results=config.news_max_results,
                 search_timeout=config.search_timeout,
@@ -623,7 +619,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     project_root = Path(__file__).resolve().parent
-    load_dotenv(project_root / ".env")
+    load_project_env(project_root)
     args = parse_args()
 
     dataset_path = Path(args.dataset).expanduser()

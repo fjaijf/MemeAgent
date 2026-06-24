@@ -6,9 +6,7 @@ from pathlib import Path
 import time
 from typing import Callable
 
-from dotenv import load_dotenv
-
-from memeagent.config import MemeAgentConfig
+from memeagent.config import MemeAgentConfig, load_project_env
 from memeagent.search_agent import SearchAgentConfig, WebSearchAgent
 
 
@@ -27,6 +25,7 @@ def _build_agent(config: MemeAgentConfig, provider: str, max_results: int) -> We
         SearchAgentConfig(
             search_provider=provider,
             search_api_key=config.search_api_key,
+            tavily_api_key=config.tavily_api_key,
             zhihu_api_key=config.zhihu_api_key,
             qwen_search_api_key=config.qwen_search_api_key,
             qwen_search_base_url=config.qwen_search_base_url,
@@ -37,10 +36,6 @@ def _build_agent(config: MemeAgentConfig, provider: str, max_results: int) -> We
             glm_search_content_size=config.glm_search_content_size,
             glm_search_domain_filter=config.glm_search_domain_filter,
             search_proxy=config.search_proxy,
-            searxng_url=config.searxng_url,
-            searxng_engines=config.searxng_engines,
-            searxng_web_categories=config.searxng_web_categories,
-            searxng_news_categories=config.searxng_news_categories,
             search_max_results=max_results,
             news_max_results=max_results,
             search_timeout=config.search_timeout,
@@ -62,34 +57,6 @@ def _check_ddgs_news(agent: WebSearchAgent, query: str) -> list[dict[str, object
 
 def _check_zhihu(agent: WebSearchAgent, query: str) -> list[dict[str, object]]:
     return agent._search_zhihu(query, agent.config.search_max_results)
-
-
-def _check_searxng(agent: WebSearchAgent, query: str) -> list[dict[str, object]]:
-    return agent._search_searxng(
-        query,
-        agent.config.search_max_results,
-        agent.config.searxng_web_categories,
-    )
-
-
-def _check_searxng_news(agent: WebSearchAgent, query: str) -> list[dict[str, object]]:
-    return agent._search_searxng(
-        query,
-        agent.config.news_max_results,
-        agent.config.searxng_news_categories,
-    )
-
-
-def _check_google(agent: WebSearchAgent, query: str) -> list[dict[str, object]]:
-    return agent._search_google_text(query)
-
-
-def _check_brave(agent: WebSearchAgent, query: str) -> list[dict[str, object]]:
-    return agent._search_brave(query, agent.config.search_max_results)
-
-
-def _check_brave_news(agent: WebSearchAgent, query: str) -> list[dict[str, object]]:
-    return agent._search_brave(query, agent.config.news_max_results, news=True)
 
 
 def _check_tavily(agent: WebSearchAgent, query: str) -> list[dict[str, object]]:
@@ -127,11 +94,10 @@ def _check_glm_news(agent: WebSearchAgent, query: str) -> list[dict[str, object]
 def _print_config(config: MemeAgentConfig) -> None:
     print("=== Search connectivity config ===")
     print(f"proxy: {config.search_proxy or '(none)'}")
-    print(f"searxng_url: {config.searxng_url}")
-    print(f"searxng_engines: {config.searxng_engines or '(default)'}")
     print(f"search_lang: {config.search_lang}")
     print(f"search_country: {config.search_country}")
     print(f"timeout: {config.search_timeout}s")
+    print(f"tavily_api_key: {'set' if config.tavily_api_key or config.search_api_key else 'missing'}")
     print(f"zhihu_api_key: {'set' if config.zhihu_api_key or config.search_api_key else 'missing'}")
     print(
         "qwen_search_key: "
@@ -186,11 +152,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--providers",
-        default="ddgs,zhihu,searxng,google",
-        help=(
-            "Comma-separated providers to test: ddgs, zhihu, searxng, google, "
-            "brave, tavily, qwen, glm."
-        ),
+        default="ddgs,zhihu,qwen,glm",
+        help="Comma-separated providers to test: ddgs, zhihu, tavily, qwen, glm.",
     )
     parser.add_argument(
         "--max-results",
@@ -215,7 +178,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     project_root = Path(__file__).resolve().parent
-    load_dotenv(project_root / ".env")
+    load_project_env(project_root)
 
     args = parse_args()
     config = MemeAgentConfig.from_env()
@@ -225,10 +188,6 @@ def main() -> int:
     web_checks: dict[str, ProviderCheck] = {
         "ddgs": _check_ddgs,
         "zhihu": _check_zhihu,
-        "searxng": _check_searxng,
-        "google": _check_google,
-        "googlesearch": _check_google,
-        "brave": _check_brave,
         "tavily": _check_tavily,
         "qwen": _check_qwen,
         "glm": _check_glm,
@@ -237,8 +196,6 @@ def main() -> int:
     }
     news_checks: dict[str, ProviderCheck] = {
         "ddgs": _check_ddgs_news,
-        "searxng": _check_searxng_news,
-        "brave": _check_brave_news,
         "tavily": _check_tavily_news,
         "qwen": _check_qwen_news,
         "glm": _check_glm_news,

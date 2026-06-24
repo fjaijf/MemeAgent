@@ -7,10 +7,8 @@ from pathlib import Path
 import sys
 from typing import Any
 
-from dotenv import load_dotenv
-
 from .agent import MemeAgent
-from .config import MemeAgentConfig
+from .config import MemeAgentConfig, load_project_env
 from .context_fetcher import ContextFetchResult, fetch_contexts_for_results
 from .llm import create_llm
 from .search_agent import PlannedSearchQuery, SearchAgentConfig, WebSearchAgent
@@ -97,6 +95,7 @@ def build_search_config(
     return SearchAgentConfig(
         search_provider=config.search_provider,
         search_api_key=config.search_api_key,
+        tavily_api_key=config.tavily_api_key,
         zhihu_api_key=config.zhihu_api_key,
         qwen_search_api_key=config.qwen_search_api_key,
         qwen_search_base_url=config.qwen_search_base_url,
@@ -107,10 +106,6 @@ def build_search_config(
         glm_search_content_size=config.glm_search_content_size,
         glm_search_domain_filter=config.glm_search_domain_filter,
         search_proxy=config.search_proxy,
-        searxng_url=config.searxng_url,
-        searxng_engines=config.searxng_engines,
-        searxng_web_categories=config.searxng_web_categories,
-        searxng_news_categories=config.searxng_news_categories,
         search_max_results=config.search_max_results,
         news_max_results=config.news_max_results,
         search_timeout=config.search_timeout,
@@ -385,6 +380,8 @@ def _apply_overrides(config: MemeAgentConfig, args: argparse.Namespace) -> MemeA
         overrides["search_provider"] = args.search_provider.strip()
     if args.search_api_key is not None:
         overrides["search_api_key"] = args.search_api_key.strip() or None
+    if args.tavily_api_key is not None:
+        overrides["tavily_api_key"] = args.tavily_api_key.strip() or None
     if args.zhihu_api_key is not None:
         overrides["zhihu_api_key"] = args.zhihu_api_key.strip() or None
     if args.qwen_search_api_key is not None:
@@ -405,14 +402,6 @@ def _apply_overrides(config: MemeAgentConfig, args: argparse.Namespace) -> MemeA
         overrides["glm_search_domain_filter"] = (
             args.glm_search_domain_filter.strip() or None
         )
-    if args.searxng_url is not None:
-        overrides["searxng_url"] = args.searxng_url.strip()
-    if args.searxng_engines is not None:
-        overrides["searxng_engines"] = args.searxng_engines.strip() or None
-    if args.searxng_web_categories is not None:
-        overrides["searxng_web_categories"] = args.searxng_web_categories.strip()
-    if args.searxng_news_categories is not None:
-        overrides["searxng_news_categories"] = args.searxng_news_categories.strip()
     if args.search_proxy is not None:
         overrides["search_proxy"] = args.search_proxy.strip() or None
     if args.search_max_results is not None:
@@ -488,9 +477,10 @@ def parse_args() -> argparse.Namespace:
         "--provider",
         dest="search_provider",
         default=None,
-        help="Search provider: ddgs, google, searxng, brave, tavily, zhihu, qwen, glm, or comma-separated combinations.",
+        help="Search provider: ddgs, tavily, zhihu, qwen, glm, or comma-separated combinations.",
     )
     parser.add_argument("--search-api-key", default=None)
+    parser.add_argument("--tavily-api-key", default=None)
     parser.add_argument("--zhihu-api-key", default=None)
     parser.add_argument("--qwen-search-api-key", default=None)
     parser.add_argument("--qwen-search-model", default=None)
@@ -500,10 +490,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--glm-search-recency-filter", default=None)
     parser.add_argument("--glm-search-content-size", default=None)
     parser.add_argument("--glm-search-domain-filter", default=None)
-    parser.add_argument("--searxng-url", default=None)
-    parser.add_argument("--searxng-engines", default=None)
-    parser.add_argument("--searxng-web-categories", default=None)
-    parser.add_argument("--searxng-news-categories", default=None)
     parser.add_argument("--search-proxy", default=None)
     parser.add_argument("--search-max-results", type=int, default=None)
     parser.add_argument("--news-max-results", type=int, default=None)
@@ -528,7 +514,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     project_root = _project_root()
-    load_dotenv(project_root / ".env")
+    load_project_env(project_root)
     args = parse_args()
     context = args.context
     if args.context_file:

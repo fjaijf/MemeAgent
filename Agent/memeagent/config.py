@@ -2,6 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+
+def load_project_env(project_root: str | Path) -> None:
+    root = Path(project_root)
+    load_dotenv(root / ".env")
+    load_dotenv(root / ".env.local", override=True)
 
 
 @dataclass(frozen=True)
@@ -22,6 +31,7 @@ class MemeAgentConfig:
     controller_thinking_enabled: bool
     search_provider: str
     search_api_key: str | None
+    tavily_api_key: str | None
     zhihu_api_key: str | None
     qwen_search_api_key: str | None
     qwen_search_base_url: str
@@ -32,10 +42,6 @@ class MemeAgentConfig:
     glm_search_content_size: str
     glm_search_domain_filter: str | None
     search_proxy: str | None
-    searxng_url: str
-    searxng_engines: str | None
-    searxng_web_categories: str
-    searxng_news_categories: str
     search_max_results: int
     news_max_results: int
     search_timeout: float
@@ -114,6 +120,11 @@ class MemeAgentConfig:
                 os.getenv("MEMEAGENT_SEARCH_API_KEY", "").strip().strip('"').strip("'")
                 or None
             ),
+            tavily_api_key=(
+                os.getenv("MEMEAGENT_TAVILY_API_KEY", "").strip().strip('"').strip("'")
+                or os.getenv("TAVILY_API_KEY", "").strip().strip('"').strip("'")
+                or None
+            ),
             zhihu_api_key=(
                 os.getenv("MEMEAGENT_ZHIHU_API_KEY", "").strip().strip('"').strip("'")
                 or None
@@ -160,24 +171,6 @@ class MemeAgentConfig:
                 os.getenv("MEMEAGENT_SEARCH_PROXY", "").strip().strip('"').strip("'")
                 or None
             ),
-            searxng_url=(
-                os.getenv("MEMEAGENT_SEARXNG_URL", "http://localhost:8888")
-                .strip()
-                .strip('"')
-                .strip("'")
-            ),
-            searxng_engines=(
-                os.getenv("MEMEAGENT_SEARXNG_ENGINES", "").strip().strip('"').strip("'")
-                or None
-            ),
-            searxng_web_categories=os.getenv(
-                "MEMEAGENT_SEARXNG_WEB_CATEGORIES",
-                "general",
-            ).strip(),
-            searxng_news_categories=os.getenv(
-                "MEMEAGENT_SEARXNG_NEWS_CATEGORIES",
-                "news",
-            ).strip(),
             search_max_results=int(os.getenv("MEMEAGENT_SEARCH_MAX_RESULTS", "5")),
             news_max_results=int(os.getenv("MEMEAGENT_NEWS_MAX_RESULTS", "5")),
             search_timeout=float(os.getenv("MEMEAGENT_SEARCH_TIMEOUT", "12")),
