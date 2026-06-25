@@ -74,6 +74,11 @@ To use GLM as a separate controller for planning, retrieval decisions, and
 retrieval reflection while keeping the primary model for vision/final analysis:
 
 ```bash
+MEMEAGENT_PROVIDER=openai-compatible
+OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+MEMEAGENT_MODEL=qwen3.7-plus
+DASHSCOPE_API_KEY=your_dashscope_api_key
+
 MEMEAGENT_CONTROLLER_PROVIDER=glm
 MEMEAGENT_CONTROLLER_MODEL=glm-5.1
 MEMEAGENT_CONTROLLER_THINKING=true
@@ -238,13 +243,27 @@ MEMEAGENT_SEARCH_PROVIDER=zhihu
 MEMEAGENT_ZHIHU_API_KEY=your_zhihu_access_secret
 ```
 
+To use Anspire Search:
+
+```bash
+MEMEAGENT_SEARCH_PROVIDER=anspire
+MEMEAGENT_ANSPIRE_API_KEY=your_anspire_api_key
+```
+
+The Anspire demo runs the same retrieve pipeline with `search_provider=anspire`
+without changing your default provider:
+
+```bash
+python retrieve_anspire_demo.py --topic "meme sentiment analysis" --max-results 3
+```
+
 To use Qwen/DashScope's built-in model search as the MemeAgent retrieval
 provider:
 
 ```bash
 MEMEAGENT_SEARCH_PROVIDER=qwen
 DASHSCOPE_API_KEY=your_dashscope_api_key
-MEMEAGENT_QWEN_SEARCH_MODEL=qwen-plus
+MEMEAGENT_QWEN_SEARCH_MODEL=qwen3.7-plus
 MEMEAGENT_QWEN_SEARCH_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 ```
 
@@ -281,6 +300,16 @@ If the selected search API needs a local HTTP proxy, set:
 ```bash
 MEMEAGENT_SEARCH_PROXY=http://127.0.0.1:7890
 ```
+
+Thread/Page Context fetching can use a proxy only when direct page fetching
+fails with connection, timeout, or retryable HTTP errors:
+
+```bash
+MEMEAGENT_CONTEXT_PROXY=http://127.0.0.1:7890
+```
+
+If `MEMEAGENT_CONTEXT_PROXY` is not set, it falls back to
+`MEMEAGENT_SEARCH_PROXY`.
 
 ## How This Maps To TradingAgents
 

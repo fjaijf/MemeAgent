@@ -35,13 +35,14 @@ except ImportError:
     ZhipuAI = None
 
 from .cache import SearchResultCache
+from .context_fetcher import ContextFetchResult, fetch_contexts_for_results
 
 
 logger = logging.getLogger(__name__)
 
 _TAVILY_SEARCH_API = "https://api.tavily.com/search"
 _ZHIHU_SEARCH_API = "https://developer.zhihu.com/api/v1/content/zhihu_search"
-_QWEN_COMPATIBLE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+_ANSPIRE_SEARCH_API = "https://plugin.anspire.cn/api/ntsearch/search"
 _SEARCH_PARALLEL_WORKERS = 8
 _DEFAULT_CONTEXT_SITES = (
     "reddit.com",
@@ -76,15 +77,15 @@ class SearchAgentConfig:
     search_api_key: str | None = None
     tavily_api_key: str | None = None
     zhihu_api_key: str | None = None
-    qwen_search_api_key: str | None = None
-    qwen_search_base_url: str = _QWEN_COMPATIBLE_BASE_URL
-    qwen_search_model: str = "qwen-plus"
+    anspire_api_key: str | None = None
     glm_search_api_key: str | None = None
     glm_search_engine: str = "search_pro"
     glm_search_recency_filter: str = "noLimit"
     glm_search_content_size: str = "medium"
     glm_search_domain_filter: str | None = None
     search_proxy: str | None = None
+    ddgs_proxy: str | None = None
+    context_proxy: str | None = None
     search_max_results: int = 5
     news_max_results: int = 5
     search_timeout: float = 12.0
@@ -108,6 +109,76 @@ def _clean_text(value: Any) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+def _format_context_results(results: list[ContextFetchResult]) -> str:
+    if not results:
+        return "## Thread/Page Context\nNo high-value platform URLs were fetched."
+
+    lines = ["## Thread/Page Context"]
+    readable_results = [
+        item
+        for item in results
+        if not item.error and (item.title or item.post_text or (item.comments or []))
+    ]
+    empty_results = [
+        item
+        for item in results
+        if not item.error and not (item.title or item.post_text or (item.comments or []))
+    ]
+    failed_results = [item for item in results if item.error]
+    if not readable_results and failed_results:
+        lines.append(
+            "No readable public context was extracted from the selected platform URLs."
+        )
+        lines.append(
+            "Fetch diagnostics: "
+            + "; ".join(
+                f"{item.source_id} {item.site}: {item.error}"
+                for item in failed_results
+            )
+        )
+        return "\n".join(lines)
+
+    for idx, item in enumerate([*readable_results, *empty_results], start=1):
+        label = f"C{idx}"
+        lines.append(
+            f"[{label}] Context for [{item.source_id}] ({item.site})\n"
+            f"   URL: {item.url}"
+        )
+        if item.title:
+            lines.append(f"   Title: {item.title}")
+        if item.metadata:
+            metadata = " | ".join(
+                f"{key}={value}" for key, value in item.metadata.items() if value
+            )
+            if metadata:
+                lines.append(f"   Metadata: {metadata}")
+        if item.post_text:
+            lines.append(f"   Post/Page text: {item.post_text}")
+        comments = item.comments or []
+        if comments:
+            lines.append("   Comments/context:")
+            for comment_index, comment in enumerate(comments, start=1):
+                lines.append(f"   - c{comment_index}: {comment}")
+        if not item.title and not item.post_text and not comments:
+            lines.append("   No readable public context extracted.")
+    if failed_results:
+        lines.append(
+            "Fetch diagnostics: "
+            + "; ".join(
+                f"{item.source_id} {item.site}: {item.error}"
+                for item in failed_results
+            )
+        )
+    return "\n".join(lines)
+
+
+def _with_provider_metadata(
+    results: list[dict[str, Any]],
+    provider: str,
+) -> list[dict[str, Any]]:
+    return [{**item, "provider": provider} for item in results]
 
 
 def _compact_query_text(value: str, max_chars: int = 220) -> str:
@@ -529,7 +600,10 @@ class WebSearchAgent:
             kind="web",
             provider=provider,
             query=query,
-            search_fn=lambda: self._search_text_provider_uncached(provider, query),
+            search_fn=lambda: _with_provider_metadata(
+                self._search_text_provider_uncached(provider, query),
+                provider,
+            ),
         )
 
     def _search_text_provider_uncached(
@@ -550,8 +624,8 @@ class WebSearchAgent:
                 query,
                 max_results=self.config.search_max_results,
             )
-        if provider == "qwen":
-            return self._search_qwen(
+        if provider == "anspire":
+            return self._search_anspire(
                 query,
                 max_results=self.config.search_max_results,
             )
@@ -562,7 +636,7 @@ class WebSearchAgent:
             )
         raise ValueError(
             f"Unsupported search provider '{provider}'. "
-            "Use ddgs, tavily, zhihu, qwen, or glm."
+            "Use ddgs, tavily, zhihu, anspire, or glm."
         )
 
     def _search_news(self, query: str) -> list[dict[str, Any]]:
@@ -594,7 +668,10 @@ class WebSearchAgent:
             kind="news",
             provider=provider,
             query=query,
-            search_fn=lambda: self._search_news_provider_uncached(provider, query),
+            search_fn=lambda: _with_provider_metadata(
+                self._search_news_provider_uncached(provider, query),
+                provider,
+            ),
         )
 
     def _search_news_provider_uncached(
@@ -612,11 +689,10 @@ class WebSearchAgent:
             )
         if provider == "zhihu":
             return []
-        if provider == "qwen":
-            return self._search_qwen(
-                query,
+        if provider == "anspire":
+            return self._search_anspire(
+                _with_news_intent(query),
                 max_results=self.config.news_max_results,
-                news=True,
             )
         if provider in {"glm", "zai", "zhipu"}:
             return self._search_glm(
@@ -626,7 +702,7 @@ class WebSearchAgent:
             )
         raise ValueError(
             f"Unsupported search provider '{provider}'. "
-            "Use ddgs, tavily, zhihu, qwen, or glm."
+            "Use ddgs, tavily, zhihu, anspire, or glm."
         )
 
     def _cached_provider_search(
@@ -649,7 +725,7 @@ class WebSearchAgent:
                 provider,
                 query,
             )
-            return cached.value
+            return _with_provider_metadata(cached.value, provider)
 
         self._record_cache_stat("miss")
         results = search_fn()
@@ -680,8 +756,6 @@ class WebSearchAgent:
             "search_lang": self.config.search_lang,
             "search_context_sites": self.config.search_context_sites,
             "tavily_search_depth": self.config.tavily_search_depth,
-            "qwen_search_base_url": self.config.qwen_search_base_url,
-            "qwen_search_model": self.config.qwen_search_model,
             "glm_search_engine": self.config.glm_search_engine,
             "glm_search_recency_filter": self.config.glm_search_recency_filter,
             "glm_search_content_size": self.config.glm_search_content_size,
@@ -700,19 +774,20 @@ class WebSearchAgent:
 
     def _open_ddgs(self):
         candidates: list[dict[str, Any]] = []
-        if self.config.search_proxy:
+        ddgs_proxy = self.config.ddgs_proxy or self.config.search_proxy
+        if ddgs_proxy:
             candidates.extend(
                 [
                     {
-                        "proxy": self.config.search_proxy,
+                        "proxy": ddgs_proxy,
                         "timeout": self.config.search_timeout,
                     },
                     {
-                        "proxies": self.config.search_proxy,
+                        "proxies": ddgs_proxy,
                         "timeout": self.config.search_timeout,
                     },
-                    {"proxy": self.config.search_proxy},
-                    {"proxies": self.config.search_proxy},
+                    {"proxy": ddgs_proxy},
+                    {"proxies": ddgs_proxy},
                 ]
             )
         candidates.extend([{"timeout": self.config.search_timeout}, {}])
@@ -778,119 +853,48 @@ class WebSearchAgent:
             if isinstance(item, dict)
         ]
 
-    def _search_qwen(
+    def _search_anspire(
         self,
         query: str,
         max_results: int,
-        news: bool = False,
     ) -> list[dict[str, Any]]:
         api_key = (
-            self.config.qwen_search_api_key
+            self.config.anspire_api_key
             or self.config.search_api_key
-            or os.getenv("DASHSCOPE_API_KEY")
-            or os.getenv("OPENAI_API_KEY")
+            or os.getenv("MEMEAGENT_ANSPIRE_API_KEY")
+            or os.getenv("ANSPIRE_API_KEY")
         )
         if not api_key:
             raise ValueError(
-                "DASHSCOPE_API_KEY, OPENAI_API_KEY, MEMEAGENT_QWEN_SEARCH_API_KEY, "
-                "or MEMEAGENT_SEARCH_API_KEY is required for Qwen search"
+                "MEMEAGENT_ANSPIRE_API_KEY, ANSPIRE_API_KEY, or "
+                "MEMEAGENT_SEARCH_API_KEY is required for Anspire search"
             )
 
-        prompt = query if not news else _with_news_intent(query)
-        base_url = _clean_text(self.config.qwen_search_base_url) or _QWEN_COMPATIBLE_BASE_URL
-        endpoint = base_url.rstrip("/")
-        if endpoint.endswith("/chat/completions"):
-            url = endpoint
-        else:
-            url = f"{endpoint}/chat/completions"
-
-        payload: dict[str, Any] = {
-            "model": self.config.qwen_search_model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a web search retriever. Return concise factual "
-                        "findings and include source URLs when available."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0,
-            "enable_search": True,
-        }
-        request_kwargs: dict[str, Any] = {
-            "headers": {
+        qs = urlencode({"query": query, "top_k": max_results})
+        req = Request(
+            f"{_ANSPIRE_SEARCH_API}?{qs}",
+            headers={
                 "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
+                "Accept": "application/json",
             },
-            "json": payload,
-            "timeout": self.config.search_timeout,
-        }
-        if self.config.search_proxy:
-            request_kwargs["proxies"] = {
-                "http": self.config.search_proxy,
-                "https": self.config.search_proxy,
-            }
+        )
+        with self._open_url(req) as resp:
+            payload = json.loads(resp.read())
 
-        response = requests.post(url, **request_kwargs)
-        response.raise_for_status()
-        payload = response.json()
-        return self._normalize_qwen_payload(payload, query=query, max_results=max_results)
+        return self._normalize_anspire_payload(payload, max_results=max_results)
 
-    def _normalize_qwen_payload(
+    def _normalize_anspire_payload(
         self,
         payload: Any,
-        query: str,
         max_results: int,
     ) -> list[dict[str, Any]]:
         payload = self._object_to_plain_data(payload)
-        choices = payload.get("choices") if isinstance(payload, dict) else []
-        message = {}
-        if choices and isinstance(choices[0], dict):
-            message = choices[0].get("message") or {}
-
-        content = _clean_text(message.get("content") if isinstance(message, dict) else "")
-        candidates: list[Any] = []
-        if isinstance(message, dict):
-            for key in (
-                "search_info",
-                "search_results",
-                "citations",
-                "references",
-                "annotations",
-            ):
-                value = message.get(key)
-                if value:
-                    candidates.extend(value if isinstance(value, list) else [value])
-        if isinstance(payload, dict):
-            for key in ("search_info", "search_results", "citations", "references"):
-                value = payload.get(key)
-                if value:
-                    candidates.extend(value if isinstance(value, list) else [value])
-
-        results = [
-            self._normalize_vendor_search_item(item, default_source="Qwen Search")
-            for item in candidates
+        raw_results = self._extract_result_list(payload)
+        return [
+            self._normalize_vendor_search_item(item, default_source="Anspire Search")
+            for item in raw_results[:max_results]
             if isinstance(item, dict)
         ]
-        results = [
-            item
-            for item in results
-            if _clean_text(item.get("title")) or _clean_text(item.get("body")) or _clean_text(item.get("href"))
-        ]
-        if results:
-            return results[:max_results]
-        if not content:
-            return []
-        return [
-            {
-                "title": f"Qwen search answer: {query}",
-                "body": content,
-                "href": "",
-                "source": "Qwen Search",
-            }
-        ][:max_results]
 
     def _search_glm(
         self,
@@ -908,6 +912,8 @@ class WebSearchAgent:
         api_key = (
             self.config.glm_search_api_key
             or self.config.search_api_key
+            or os.getenv("MEMEAGENT_GLM_API_KEY")
+            or os.getenv("MEMEAGENT_ZAI_API_KEY")
             or os.getenv("ZAI_API_KEY")
             or os.getenv("GLM_API_KEY")
             or os.getenv("ZHIPUAI_API_KEY")
@@ -915,8 +921,8 @@ class WebSearchAgent:
         if not api_key:
             raise ValueError(
                 "ZAI_API_KEY, GLM_API_KEY, ZHIPUAI_API_KEY, "
-                "MEMEAGENT_GLM_SEARCH_API_KEY, or MEMEAGENT_SEARCH_API_KEY "
-                "is required for GLM search"
+                "MEMEAGENT_GLM_API_KEY, MEMEAGENT_GLM_SEARCH_API_KEY, or "
+                "MEMEAGENT_SEARCH_API_KEY is required for GLM search"
             )
 
         client = (
@@ -1489,14 +1495,24 @@ class WebSearchAgent:
                 title = _clean_text(item.get("title"))
                 body = _clean_text(item.get("body"))
                 href = _clean_text(item.get("href") or item.get("url"))
+                provider = _clean_text(item.get("provider"))
                 result_type = self._classify_result_type(item)
                 web_lines.append(
                     f"[{source_id}] {title}\n"
+                    f"   Provider: {provider or 'N/A'}\n"
                     f"   Candidate type: {result_type}\n"
                     f"   Snippet: {body or 'N/A'}\n"
                     f"   URL: {href or 'N/A'}"
                 )
             sections.append("\n".join(web_lines))
+            context_results = fetch_contexts_for_results(
+                text_results,
+                context_sites=self.config.search_context_sites,
+                fallback_proxy=self.config.context_proxy,
+                timeout=min(self.config.search_timeout, 8.0),
+                total_timeout=max(self.config.search_timeout, 12.0),
+            )
+            sections.append(_format_context_results(context_results))
 
         if news_results:
             news_lines = ["## News Results"]
@@ -1507,9 +1523,11 @@ class WebSearchAgent:
                 source = _clean_text(item.get("source"))
                 date = _clean_text(item.get("date"))
                 href = _clean_text(item.get("href") or item.get("url"))
+                provider = _clean_text(item.get("provider"))
                 result_type = self._classify_result_type(item, news=True)
                 news_lines.append(
                     f"[{source_id}] {title}\n"
+                    f"   Provider: {provider or 'N/A'}\n"
                     f"   Candidate type: {result_type}\n"
                     f"   Source: {source or 'N/A'} | Date: {date or 'N/A'}\n"
                     f"   Snippet: {body or 'N/A'}\n"

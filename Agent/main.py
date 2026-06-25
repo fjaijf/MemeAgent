@@ -63,7 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--search-provider",
         default=None,
-        help="Override search provider. Supported values include ddgs, tavily, zhihu, qwen, glm, or comma-separated combinations.",
+        help="Override search provider. Supported values include ddgs, tavily, zhihu, anspire, qwen, glm, or comma-separated combinations.",
     )
     parser.add_argument(
         "--search-api-key",
@@ -79,6 +79,11 @@ def parse_args() -> argparse.Namespace:
         "--zhihu-api-key",
         default=None,
         help="Override Zhihu search API key.",
+    )
+    parser.add_argument(
+        "--anspire-api-key",
+        default=None,
+        help="Override Anspire search API key.",
     )
     parser.add_argument(
         "--qwen-search-model",
@@ -104,6 +109,11 @@ def parse_args() -> argparse.Namespace:
         "--search-proxy",
         default=None,
         help="Override search proxy URL, for example http://127.0.0.1:7890.",
+    )
+    parser.add_argument(
+        "--context-proxy",
+        default=None,
+        help="Override page/context fetch proxy URL, for example http://127.0.0.1:7890.",
     )
     parser.add_argument(
         "--search-max-results",
@@ -220,6 +230,8 @@ def main() -> None:
         search_overrides["tavily_api_key"] = args.tavily_api_key.strip() or None
     if args.zhihu_api_key is not None:
         search_overrides["zhihu_api_key"] = args.zhihu_api_key.strip() or None
+    if args.anspire_api_key is not None:
+        search_overrides["anspire_api_key"] = args.anspire_api_key.strip() or None
     if args.qwen_search_model is not None:
         search_overrides["qwen_search_model"] = args.qwen_search_model.strip()
     if args.qwen_search_base_url is not None:
@@ -231,7 +243,12 @@ def main() -> None:
             args.glm_search_domain_filter.strip() or None
         )
     if args.search_proxy is not None:
-        search_overrides["search_proxy"] = args.search_proxy.strip() or None
+        search_proxy = args.search_proxy.strip() or None
+        search_overrides["search_proxy"] = search_proxy
+        if args.context_proxy is None:
+            search_overrides["context_proxy"] = search_proxy
+    if args.context_proxy is not None:
+        search_overrides["context_proxy"] = args.context_proxy.strip() or None
     if args.search_max_results is not None:
         search_overrides["search_max_results"] = args.search_max_results
     if args.news_max_results is not None:
@@ -280,6 +297,7 @@ def main() -> None:
             search_api_key=config.search_api_key,
             tavily_api_key=config.tavily_api_key,
             zhihu_api_key=config.zhihu_api_key,
+            anspire_api_key=config.anspire_api_key,
             qwen_search_api_key=config.qwen_search_api_key,
             qwen_search_base_url=config.qwen_search_base_url,
             qwen_search_model=config.qwen_search_model,
@@ -289,6 +307,7 @@ def main() -> None:
             glm_search_content_size=config.glm_search_content_size,
             glm_search_domain_filter=config.glm_search_domain_filter,
             search_proxy=config.search_proxy,
+            context_proxy=config.context_proxy,
             search_max_results=config.search_max_results,
             news_max_results=config.news_max_results,
             search_timeout=config.search_timeout,

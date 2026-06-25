@@ -11,7 +11,12 @@ from .agent import MemeAgent
 from .config import MemeAgentConfig, load_project_env
 from .context_fetcher import ContextFetchResult, fetch_contexts_for_results
 from .llm import create_llm
-from .search_agent import PlannedSearchQuery, SearchAgentConfig, WebSearchAgent
+from .search_agent import (
+    PlannedSearchQuery,
+    SearchAgentConfig,
+    WebSearchAgent,
+    _format_context_results,
+)
 
 
 _RETRIEVE_NEWS_PROVIDER = "ddgs"
@@ -97,6 +102,7 @@ def build_search_config(
         search_api_key=config.search_api_key,
         tavily_api_key=config.tavily_api_key,
         zhihu_api_key=config.zhihu_api_key,
+        anspire_api_key=config.anspire_api_key,
         qwen_search_api_key=config.qwen_search_api_key,
         qwen_search_base_url=config.qwen_search_base_url,
         qwen_search_model=config.qwen_search_model,
@@ -106,6 +112,7 @@ def build_search_config(
         glm_search_content_size=config.glm_search_content_size,
         glm_search_domain_filter=config.glm_search_domain_filter,
         search_proxy=config.search_proxy,
+        context_proxy=config.context_proxy,
         search_max_results=config.search_max_results,
         news_max_results=config.news_max_results,
         search_timeout=config.search_timeout,
@@ -222,7 +229,13 @@ def run_retrieval(
             errors.append(news_error)
 
     context_results = (
-        fetch_contexts_for_results(web_results)
+        fetch_contexts_for_results(
+            web_results,
+            context_sites=agent.config.search_context_sites,
+            fallback_proxy=agent.config.context_proxy,
+            timeout=min(agent.config.search_timeout, 8.0),
+            total_timeout=max(agent.config.search_timeout, 12.0),
+        )
         if web_results and mode in {"web", "both"}
         else []
     )
@@ -269,47 +282,15 @@ def _format_results(
         title = _clean_text(item.get("title"))
         body = _clean_text(item.get("body"))
         href = _clean_text(item.get("href") or item.get("url"))
+        provider = _clean_text(item.get("provider"))
         result_type = agent._classify_result_type(item, news=news)
         lines.append(
             f"[{source_id}] {title}\n"
+            f"   Provider: {provider or 'N/A'}\n"
             f"   Candidate type: {result_type}\n"
             f"   Snippet: {body or 'N/A'}\n"
             f"   URL: {href or 'N/A'}"
         )
-    return "\n".join(lines)
-
-
-def _format_context_results(results: list[ContextFetchResult]) -> str:
-    if not results:
-        return "## Thread/Page Context\nNo high-value platform URLs were fetched."
-
-    lines = ["## Thread/Page Context"]
-    for idx, item in enumerate(results, start=1):
-        label = f"C{idx}"
-        lines.append(
-            f"[{label}] Context for [{item.source_id}] ({item.site})\n"
-            f"   URL: {item.url}"
-        )
-        if item.error:
-            lines.append(f"   Error: {item.error}")
-            continue
-        if item.title:
-            lines.append(f"   Title: {item.title}")
-        if item.metadata:
-            metadata = " | ".join(
-                f"{key}={value}" for key, value in item.metadata.items() if value
-            )
-            if metadata:
-                lines.append(f"   Metadata: {metadata}")
-        if item.post_text:
-            lines.append(f"   Post/Page text: {item.post_text}")
-        comments = item.comments or []
-        if comments:
-            lines.append("   Comments/context:")
-            for comment_index, comment in enumerate(comments, start=1):
-                lines.append(f"   - c{comment_index}: {comment}")
-        if not item.title and not item.post_text and not comments:
-            lines.append("   No readable public context extracted.")
     return "\n".join(lines)
 
 
@@ -384,6 +365,8 @@ def _apply_overrides(config: MemeAgentConfig, args: argparse.Namespace) -> MemeA
         overrides["tavily_api_key"] = args.tavily_api_key.strip() or None
     if args.zhihu_api_key is not None:
         overrides["zhihu_api_key"] = args.zhihu_api_key.strip() or None
+    if args.anspire_api_key is not None:
+        overrides["anspire_api_key"] = args.anspire_api_key.strip() or None
     if args.qwen_search_api_key is not None:
         overrides["qwen_search_api_key"] = args.qwen_search_api_key.strip() or None
     if args.qwen_search_model is not None:
@@ -403,7 +386,12 @@ def _apply_overrides(config: MemeAgentConfig, args: argparse.Namespace) -> MemeA
             args.glm_search_domain_filter.strip() or None
         )
     if args.search_proxy is not None:
-        overrides["search_proxy"] = args.search_proxy.strip() or None
+        search_proxy = args.search_proxy.strip() or None
+        overrides["search_proxy"] = search_proxy
+        if args.context_proxy is None:
+            overrides["context_proxy"] = search_proxy
+    if args.context_proxy is not None:
+        overrides["context_proxy"] = args.context_proxy.strip() or None
     if args.search_max_results is not None:
         overrides["search_max_results"] = args.search_max_results
     if args.news_max_results is not None:
@@ -477,11 +465,12 @@ def parse_args() -> argparse.Namespace:
         "--provider",
         dest="search_provider",
         default=None,
-        help="Search provider: ddgs, tavily, zhihu, qwen, glm, or comma-separated combinations.",
+        help="Search provider: ddgs, tavily, zhihu, anspire, qwen, glm, or comma-separated combinations.",
     )
     parser.add_argument("--search-api-key", default=None)
     parser.add_argument("--tavily-api-key", default=None)
     parser.add_argument("--zhihu-api-key", default=None)
+    parser.add_argument("--anspire-api-key", default=None)
     parser.add_argument("--qwen-search-api-key", default=None)
     parser.add_argument("--qwen-search-model", default=None)
     parser.add_argument("--qwen-search-base-url", default=None)
@@ -491,6 +480,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--glm-search-content-size", default=None)
     parser.add_argument("--glm-search-domain-filter", default=None)
     parser.add_argument("--search-proxy", default=None)
+    parser.add_argument(
+        "--context-proxy",
+        default=None,
+        help=(
+            "Proxy used only as a fallback when Thread/Page Context fetching "
+            "fails directly. Defaults to MEMEAGENT_CONTEXT_PROXY, then "
+            "MEMEAGENT_SEARCH_PROXY."
+        ),
+    )
     parser.add_argument("--search-max-results", type=int, default=None)
     parser.add_argument("--news-max-results", type=int, default=None)
     parser.add_argument("--search-timeout", type=float, default=None)

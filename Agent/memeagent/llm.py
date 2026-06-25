@@ -246,8 +246,8 @@ class LocalTransformersChatClient:
             from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor, AutoTokenizer
         except (ImportError, ModuleNotFoundError) as exc:
             raise RuntimeError(
-                "Local Transformers mode requires torch, transformers, accelerate, "
-                "and pillow. Install the local extras, for example: "
+                "Local Transformers mode requires torch, torchvision, transformers, "
+                "accelerate, and pillow. Install the local extras, for example: "
                 "pip install -e .[local]"
             ) from exc
 
@@ -509,9 +509,46 @@ class LocalTransformersChatClient:
         return content.strip()
 
 
-def _openai_api_key() -> str:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key or api_key == "your_api_key_here":
+def _env_secret(*names: str) -> str | None:
+    placeholders = {
+        "your-api-key",
+        "your_api_key_here",
+        "your_dashscope_api_key",
+        "your_qwen_api_key",
+        "your_zai_api_key",
+        "your_real_key",
+    }
+    for name in names:
+        value = os.getenv(name, "").strip().strip('"').strip("'")
+        if value and value not in placeholders:
+            return value
+    return None
+
+
+def _is_qwen_compatible_config(config: MemeAgentConfig) -> bool:
+    model = config.model.lower()
+    base_url = (config.base_url or "").lower()
+    return model.startswith("qwen") or "dashscope.aliyuncs.com" in base_url
+
+
+def _openai_compatible_api_key(config: MemeAgentConfig) -> str:
+    if _is_qwen_compatible_config(config):
+        api_key = _env_secret(
+            "MEMEAGENT_QWEN_API_KEY",
+            "QWEN_API_KEY",
+            "DASHSCOPE_API_KEY",
+            "OPENAI_API_KEY",
+            "MEMEAGENT_API_KEY",
+        )
+        if api_key:
+            return api_key
+        raise ValueError(
+            "Qwen/DashScope API key is not set. Add DASHSCOPE_API_KEY, "
+            "QWEN_API_KEY, MEMEAGENT_QWEN_API_KEY, or OPENAI_API_KEY to .env."
+        )
+
+    api_key = _env_secret("OPENAI_API_KEY", "MEMEAGENT_API_KEY")
+    if not api_key:
         raise ValueError(
             "OPENAI_API_KEY is not set. Create D:\\自研Agent\\MemeAgent\\Agent\\.env "
             "from .env.example and set OPENAI_API_KEY=your_real_key, or set "
@@ -521,15 +558,18 @@ def _openai_api_key() -> str:
 
 
 def _zai_api_key() -> str:
-    api_key = (
-        os.getenv("ZAI_API_KEY")
-        or os.getenv("GLM_API_KEY")
-        or os.getenv("ZHIPUAI_API_KEY")
+    api_key = _env_secret(
+        "MEMEAGENT_GLM_API_KEY",
+        "MEMEAGENT_ZAI_API_KEY",
+        "ZAI_API_KEY",
+        "GLM_API_KEY",
+        "ZHIPUAI_API_KEY",
     )
-    if not api_key or api_key == "your-api-key":
+    if not api_key:
         raise ValueError(
-            "ZAI_API_KEY is not set. Add ZAI_API_KEY=your_real_key to .env "
-            "when MEMEAGENT_CONTROLLER_PROVIDER=glm is enabled."
+            "GLM API key is not set. Add ZAI_API_KEY, GLM_API_KEY, "
+            "ZHIPUAI_API_KEY, or MEMEAGENT_GLM_API_KEY to .env when "
+            "MEMEAGENT_CONTROLLER_PROVIDER=glm is enabled."
         )
     return api_key
 
@@ -548,7 +588,10 @@ def create_llm(config: MemeAgentConfig) -> Any:
         )
 
     if config.provider in {"openai", "openai-compatible"}:
-        return OpenAICompatibleChatClient(config=config, api_key=_openai_api_key())
+        return OpenAICompatibleChatClient(
+            config=config,
+            api_key=_openai_compatible_api_key(config),
+        )
 
     if config.provider in {"glm", "zai", "zhipu"}:
         return ZhipuAIChatClient(
@@ -583,7 +626,7 @@ def create_controller_llm(config: MemeAgentConfig) -> Any | None:
     if provider in {"openai", "openai-compatible"}:
         return OpenAICompatibleChatClient(
             config=config,
-            api_key=_openai_api_key(),
+            api_key=_openai_compatible_api_key(config),
             model=config.controller_model,
             temperature=config.controller_temperature,
             timeout=config.controller_timeout,

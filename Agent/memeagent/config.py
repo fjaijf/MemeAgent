@@ -33,15 +33,14 @@ class MemeAgentConfig:
     search_api_key: str | None
     tavily_api_key: str | None
     zhihu_api_key: str | None
-    qwen_search_api_key: str | None
-    qwen_search_base_url: str
-    qwen_search_model: str
+    anspire_api_key: str | None
     glm_search_api_key: str | None
     glm_search_engine: str
     glm_search_recency_filter: str
     glm_search_content_size: str
     glm_search_domain_filter: str | None
     search_proxy: str | None
+    context_proxy: str | None
     search_max_results: int
     news_max_results: int
     search_timeout: float
@@ -129,26 +128,15 @@ class MemeAgentConfig:
                 os.getenv("MEMEAGENT_ZHIHU_API_KEY", "").strip().strip('"').strip("'")
                 or None
             ),
-            qwen_search_api_key=(
-                os.getenv("MEMEAGENT_QWEN_SEARCH_API_KEY", "").strip().strip('"').strip("'")
+            anspire_api_key=(
+                os.getenv("MEMEAGENT_ANSPIRE_API_KEY", "").strip().strip('"').strip("'")
+                or os.getenv("ANSPIRE_API_KEY", "").strip().strip('"').strip("'")
                 or None
             ),
-            qwen_search_base_url=(
-                os.getenv(
-                    "MEMEAGENT_QWEN_SEARCH_BASE_URL",
-                    "https://dashscope.aliyuncs.com/compatible-mode/v1",
-                )
-                .strip()
-                .strip('"')
-                .strip("'")
-            ),
-            qwen_search_model=(
-                os.getenv("MEMEAGENT_QWEN_SEARCH_MODEL")
-                or os.getenv("MEMEAGENT_MODEL")
-                or "qwen-plus"
-            ).strip(),
             glm_search_api_key=(
                 os.getenv("MEMEAGENT_GLM_SEARCH_API_KEY", "").strip().strip('"').strip("'")
+                or os.getenv("MEMEAGENT_GLM_API_KEY", "").strip().strip('"').strip("'")
+                or os.getenv("MEMEAGENT_ZAI_API_KEY", "").strip().strip('"').strip("'")
                 or None
             ),
             glm_search_engine=os.getenv("MEMEAGENT_GLM_SEARCH_ENGINE", "search_pro").strip(),
@@ -169,6 +157,11 @@ class MemeAgentConfig:
             ),
             search_proxy=(
                 os.getenv("MEMEAGENT_SEARCH_PROXY", "").strip().strip('"').strip("'")
+                or None
+            ),
+            context_proxy=(
+                os.getenv("MEMEAGENT_CONTEXT_PROXY", "").strip().strip('"').strip("'")
+                or os.getenv("MEMEAGENT_SEARCH_PROXY", "").strip().strip('"').strip("'")
                 or None
             ),
             search_max_results=int(os.getenv("MEMEAGENT_SEARCH_MAX_RESULTS", "5")),

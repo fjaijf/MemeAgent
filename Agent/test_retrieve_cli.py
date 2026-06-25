@@ -131,7 +131,36 @@ class RetrievalCliTests(unittest.TestCase):
         self.assertIn("## Thread/Page Context", report)
         self.assertNotIn("News query plan:", report)
 
-    def test_context_formatter_includes_comments_and_errors(self) -> None:
+    def test_report_includes_result_provider(self) -> None:
+        agent = FakeSearchAgent()
+        report = format_retrieval_report(
+            agent,
+            result=type(
+                "Result",
+                (),
+                {
+                    "query_plan": [],
+                    "news_queries": [],
+                    "web_results": [
+                        {
+                            "title": "Anspire hit",
+                            "body": "snippet",
+                            "href": "https://example.com/hit",
+                            "provider": "anspire",
+                        }
+                    ],
+                    "news_results": [],
+                    "context_results": [],
+                    "errors": [],
+                    "cache_stats": "Search cache: disabled",
+                },
+            )(),
+            mode="web",
+        )
+
+        self.assertIn("Provider: anspire", report)
+
+    def test_context_formatter_includes_comments_and_failure_diagnostics(self) -> None:
         report = _format_context_results(
             [
                 ContextFetchResult(
@@ -155,7 +184,32 @@ class RetrievalCliTests(unittest.TestCase):
         self.assertIn("Context for [W1]", report)
         self.assertIn("Original post text.", report)
         self.assertIn("user1: first comment", report)
-        self.assertIn("Error: 403 forbidden", report)
+        self.assertIn("Fetch diagnostics:", report)
+        self.assertIn("W2 x.com: 403 forbidden", report)
+        self.assertNotIn("Context for [W2]", report)
+
+    def test_context_formatter_summarizes_all_fetch_failures(self) -> None:
+        report = _format_context_results(
+            [
+                ContextFetchResult(
+                    source_id="W13",
+                    url="https://www.tiktok.com/@example/video/1",
+                    site="tiktok.com",
+                    error="ConnectionError: reset",
+                ),
+                ContextFetchResult(
+                    source_id="W22",
+                    url="https://www.zhihu.com/question/1/answer/2",
+                    site="zhihu.com",
+                    error="HTTPError: 403 Client Error",
+                ),
+            ]
+        )
+
+        self.assertIn("No readable public context was extracted", report)
+        self.assertIn("Fetch diagnostics:", report)
+        self.assertIn("W13 tiktok.com: ConnectionError: reset", report)
+        self.assertNotIn("[C1] Context for", report)
 
     def test_visual_report_is_usable_as_search_context(self) -> None:
         agent = FakeSearchAgent()

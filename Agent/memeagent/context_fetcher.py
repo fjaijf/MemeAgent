@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from html import unescape
@@ -11,6 +12,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import requests
+from requests import exceptions as requests_exceptions
 
 
 _CONTEXT_FETCH_WORKERS = 6
@@ -60,9 +62,39 @@ def _url_host(value: str) -> str:
     return host
 
 
-def _is_context_host(url: str) -> bool:
+def _normalize_context_host(value: str) -> str:
+    value = str(value or "").strip().lower()
+    if not value:
+        return ""
+    if "://" not in value:
+        value = "//" + value
+    parts = urlsplit(value)
+    host = (parts.netloc or parts.path.split("/", 1)[0]).lower()
+    return host.removeprefix("www.")
+
+
+def _parse_context_hosts(value: str | Iterable[str] | None = None) -> tuple[str, ...]:
+    if value is None:
+        return _CONTEXT_HOSTS
+    raw_hosts = value.split(",") if isinstance(value, str) else value
+    hosts: list[str] = []
+    seen: set[str] = set()
+    for raw_host in raw_hosts:
+        host = _normalize_context_host(str(raw_host))
+        if not host or host in seen:
+            continue
+        seen.add(host)
+        hosts.append(host)
+    return tuple(hosts)
+
+
+def _is_context_host(
+    url: str,
+    context_hosts: Iterable[str] | None = None,
+) -> bool:
     host = _url_host(url)
-    return any(host == site or host.endswith("." + site) for site in _CONTEXT_HOSTS)
+    hosts = tuple(context_hosts) if context_hosts is not None else _CONTEXT_HOSTS
+    return any(host == site or host.endswith("." + site) for site in hosts)
 
 
 def _request_headers() -> dict[str, str]:
@@ -75,6 +107,70 @@ def _request_headers() -> dict[str, str]:
         "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.8,zh-CN;q=0.7,zh;q=0.6",
     }
+
+
+_RETRYABLE_STATUS_CODES = {403, 408, 429, 451, 500, 502, 503, 504}
+
+
+def _request_kwargs(
+    timeout: float,
+    proxy: str | None = None,
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "headers": _request_headers(),
+        "timeout": timeout,
+    }
+    if proxy:
+        kwargs["proxies"] = {
+            "http": proxy,
+            "https": proxy,
+        }
+    return kwargs
+
+
+def _should_retry_with_proxy(exc: Exception) -> bool:
+    if isinstance(exc, requests_exceptions.HTTPError):
+        status_code = getattr(exc.response, "status_code", None)
+        return status_code in _RETRYABLE_STATUS_CODES
+    return isinstance(
+        exc,
+        (
+            requests_exceptions.ConnectionError,
+            requests_exceptions.Timeout,
+            requests_exceptions.ProxyError,
+            requests_exceptions.ChunkedEncodingError,
+            requests_exceptions.SSLError,
+        ),
+    )
+
+
+def _get_with_optional_proxy_retry(
+    url: str,
+    *,
+    timeout: float,
+    proxy: str | None = None,
+    fallback_proxy: str | None = None,
+    allow_redirects: bool = False,
+) -> requests.Response:
+    request_kwargs = _request_kwargs(timeout=timeout, proxy=proxy)
+    request_kwargs["allow_redirects"] = allow_redirects
+    try:
+        response = requests.get(url, **request_kwargs)
+        response.raise_for_status()
+        return response
+    except Exception as direct_exc:
+        if (
+            not fallback_proxy
+            or fallback_proxy == proxy
+            or not _should_retry_with_proxy(direct_exc)
+        ):
+            raise
+
+        retry_kwargs = _request_kwargs(timeout=timeout, proxy=fallback_proxy)
+        retry_kwargs["allow_redirects"] = allow_redirects
+        response = requests.get(url, **retry_kwargs)
+        response.raise_for_status()
+        return response
 
 
 class _HTMLContextParser(HTMLParser):
@@ -169,13 +265,20 @@ def _reddit_comment_text(node: dict[str, Any], comments: list[str]) -> None:
                 _reddit_comment_text(child, comments)
 
 
-def _fetch_reddit_context(source_id: str, url: str) -> ContextFetchResult:
-    response = requests.get(
+def _fetch_reddit_context(
+    source_id: str,
+    url: str,
+    *,
+    proxy: str | None = None,
+    fallback_proxy: str | None = None,
+    timeout: float = _CONTEXT_FETCH_TIMEOUT,
+) -> ContextFetchResult:
+    response = _get_with_optional_proxy_retry(
         _reddit_json_url(url),
-        headers=_request_headers(),
-        timeout=_CONTEXT_FETCH_TIMEOUT,
+        timeout=timeout,
+        proxy=proxy,
+        fallback_proxy=fallback_proxy,
     )
-    response.raise_for_status()
     payload = response.json()
     if not isinstance(payload, list) or not payload:
         raise ValueError("Reddit JSON payload did not contain listings")
@@ -220,14 +323,21 @@ def _fetch_reddit_context(source_id: str, url: str) -> ContextFetchResult:
     )
 
 
-def _fetch_generic_context(source_id: str, url: str) -> ContextFetchResult:
-    response = requests.get(
+def _fetch_generic_context(
+    source_id: str,
+    url: str,
+    *,
+    proxy: str | None = None,
+    fallback_proxy: str | None = None,
+    timeout: float = _CONTEXT_FETCH_TIMEOUT,
+) -> ContextFetchResult:
+    response = _get_with_optional_proxy_retry(
         url,
-        headers=_request_headers(),
-        timeout=_CONTEXT_FETCH_TIMEOUT,
+        timeout=timeout,
+        proxy=proxy,
+        fallback_proxy=fallback_proxy,
         allow_redirects=True,
     )
-    response.raise_for_status()
     content_type = response.headers.get("content-type", "")
     if "json" in content_type.lower():
         text = _clean_text(json.dumps(response.json(), ensure_ascii=False), max_chars=2200)
@@ -256,12 +366,31 @@ def _fetch_generic_context(source_id: str, url: str) -> ContextFetchResult:
     )
 
 
-def fetch_context_for_url(source_id: str, url: str) -> ContextFetchResult:
+def fetch_context_for_url(
+    source_id: str,
+    url: str,
+    *,
+    proxy: str | None = None,
+    fallback_proxy: str | None = None,
+    timeout: float = _CONTEXT_FETCH_TIMEOUT,
+) -> ContextFetchResult:
     host = _url_host(url)
     try:
         if "reddit.com" in host and "/comments/" in url:
-            return _fetch_reddit_context(source_id, url)
-        return _fetch_generic_context(source_id, url)
+            return _fetch_reddit_context(
+                source_id,
+                url,
+                proxy=proxy,
+                fallback_proxy=fallback_proxy,
+                timeout=timeout,
+            )
+        return _fetch_generic_context(
+            source_id,
+            url,
+            proxy=proxy,
+            fallback_proxy=fallback_proxy,
+            timeout=timeout,
+        )
     except Exception as exc:
         return ContextFetchResult(
             source_id=source_id,
@@ -273,12 +402,22 @@ def fetch_context_for_url(source_id: str, url: str) -> ContextFetchResult:
 
 def fetch_contexts_for_results(
     web_results: list[dict[str, Any]],
+    *,
+    context_sites: str | Iterable[str] | None = None,
+    proxy: str | None = None,
+    fallback_proxy: str | None = None,
+    timeout: float = _CONTEXT_FETCH_TIMEOUT,
+    total_timeout: float = _CONTEXT_TOTAL_TIMEOUT,
 ) -> list[ContextFetchResult]:
+    context_hosts = _parse_context_hosts(context_sites)
+    if not context_hosts:
+        return []
+
     targets: list[tuple[str, str]] = []
     seen_urls: set[str] = set()
     for index, item in enumerate(web_results, start=1):
         url = _clean_text(item.get("href") or item.get("url"))
-        if not url or url in seen_urls or not _is_context_host(url):
+        if not url or url in seen_urls or not _is_context_host(url, context_hosts):
             continue
         seen_urls.add(url)
         targets.append((f"W{index}", url))
@@ -286,13 +425,20 @@ def fetch_contexts_for_results(
     if not targets:
         return []
 
-    deadline = time.monotonic() + _CONTEXT_TOTAL_TIMEOUT
+    deadline = time.monotonic() + total_timeout
     executor = ThreadPoolExecutor(
         max_workers=min(_CONTEXT_FETCH_WORKERS, len(targets)),
         thread_name_prefix="memeagent-context",
     )
     futures = {
-        executor.submit(fetch_context_for_url, source_id, url): (source_id, url)
+        executor.submit(
+            fetch_context_for_url,
+            source_id,
+            url,
+            proxy=proxy,
+            fallback_proxy=fallback_proxy,
+            timeout=timeout,
+        ): (source_id, url)
         for source_id, url in targets
     }
     pending = set(futures)
@@ -311,7 +457,18 @@ def fetch_contexts_for_results(
             if not done:
                 break
             for future in done:
-                results.append(future.result())
+                source_id, url = futures[future]
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    results.append(
+                        ContextFetchResult(
+                            source_id=source_id,
+                            url=url,
+                            site=_url_host(url),
+                            error=f"{type(exc).__name__}: {exc}",
+                        )
+                    )
     finally:
         for future in pending:
             future.cancel()

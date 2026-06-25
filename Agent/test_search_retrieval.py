@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import time
 import unittest
+from unittest.mock import patch
 
 import memeagent.search_agent as search_agent_module
 from memeagent.search_agent import SearchAgentConfig, WebSearchAgent
+from memeagent.context_fetcher import ContextFetchResult
 
 
 class SearchRetrievalTests(unittest.TestCase):
@@ -197,6 +199,136 @@ class SearchRetrievalTests(unittest.TestCase):
         self.assertEqual("Tavily result", results[0]["title"])
         self.assertEqual("Tavily snippet.", results[0]["body"])
         self.assertEqual("https://example.com/tavily", results[0]["href"])
+
+    def test_anspire_search_uses_api_key_and_normalizes_results(self) -> None:
+        class FakeResponse:
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return json.dumps(
+                    {
+                        "results": [
+                            {
+                                "title": "Anspire result",
+                                "content": "Anspire snippet.",
+                                "url": "https://example.com/anspire",
+                                "date": "2026-06-25",
+                                "score": 0.9,
+                            }
+                        ]
+                    }
+                ).encode("utf-8")
+
+        class FakeAnspireAgent(WebSearchAgent):
+            def __init__(self, config: SearchAgentConfig) -> None:
+                super().__init__(config)
+                self.requests: list[object] = []
+
+            def _open_url(self, req: object, data: bytes | None = None) -> FakeResponse:
+                self.requests.append(req)
+                return FakeResponse()
+
+        agent = FakeAnspireAgent(
+            SearchAgentConfig(
+                search_provider="anspire",
+                anspire_api_key="anspire-key",
+                cache_enabled=False,
+            )
+        )
+
+        results = agent._search_text_provider_uncached("anspire", "this is fine")
+        headers = dict(agent.requests[0].header_items())
+        url = agent.requests[0].full_url
+
+        self.assertEqual("Bearer anspire-key", headers["Authorization"])
+        self.assertIn("query=this+is+fine", url)
+        self.assertIn("top_k=5", url)
+        self.assertEqual(1, len(results))
+        self.assertEqual("Anspire result", results[0]["title"])
+        self.assertEqual("Anspire snippet.", results[0]["body"])
+        self.assertEqual("https://example.com/anspire", results[0]["href"])
+        self.assertEqual("Anspire Search", results[0]["source"])
+
+    def test_provider_metadata_is_attached_to_provider_results(self) -> None:
+        class ProviderAgent(WebSearchAgent):
+            def _search_text_provider_uncached(
+                self,
+                provider: str,
+                query: str,
+            ) -> list[dict[str, object]]:
+                return [
+                    {
+                        "title": f"{provider} result",
+                        "body": query,
+                        "href": f"https://example.com/{provider}",
+                    }
+                ]
+
+        agent = ProviderAgent(SearchAgentConfig(cache_enabled=False))
+
+        result = agent._search_text_provider("anspire", "provider test")
+
+        self.assertEqual("anspire", result[0]["provider"])
+
+    def test_run_includes_thread_page_context_after_web_results(self) -> None:
+        class ProviderAgent(WebSearchAgent):
+            def _search_text_queries(
+                self,
+                queries: list[str],
+                relevance_terms: set[str] | None = None,
+            ) -> list[dict[str, object]]:
+                return [
+                    {
+                        "title": "Reddit hit",
+                        "body": "snippet",
+                        "href": "https://www.reddit.com/r/test/comments/abc/example/",
+                        "provider": "ddgs",
+                    }
+                ]
+
+            def _search_news_queries(
+                self,
+                queries: list[str],
+                context: str = "",
+            ) -> list[dict[str, object]]:
+                return []
+
+        agent = ProviderAgent(
+            SearchAgentConfig(
+                search_provider="ddgs",
+                search_context_sites="reddit.com",
+                context_proxy="http://127.0.0.1:7890",
+                cache_enabled=False,
+            )
+        )
+
+        with patch.object(
+            search_agent_module,
+            "fetch_contexts_for_results",
+            return_value=[
+                ContextFetchResult(
+                    source_id="W1",
+                    url="https://www.reddit.com/r/test/comments/abc/example/",
+                    site="reddit.com",
+                    title="Example thread",
+                    post_text="Original post text.",
+                )
+            ],
+        ) as fetch_contexts:
+            report = agent.run(topic="sample query")
+
+        self.assertIn("## Web Search Results", report)
+        self.assertIn("## Thread/Page Context", report)
+        self.assertIn("Context for [W1]", report)
+        fetch_contexts.assert_called_once()
+        self.assertEqual(
+            "http://127.0.0.1:7890",
+            fetch_contexts.call_args.kwargs["fallback_proxy"],
+        )
 
     def test_zhihu_payload_shape_is_extracted_and_normalized(self) -> None:
         agent = WebSearchAgent(SearchAgentConfig(cache_enabled=False))
