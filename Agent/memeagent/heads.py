@@ -6,6 +6,7 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from .agent import _normalize_content
+from .harmfulness_ensemble import HarmfulnessEnsembleAgent
 from .rubrics import MEME_ANALYSIS_RUBRIC
 
 
@@ -233,6 +234,21 @@ class MemeAnalysisHeadRunner:
         evidence_context: str,
         input_mode: str,
     ) -> HeadResult:
+        if head.name == "harmfulness":
+            ensemble = HarmfulnessEnsembleAgent(
+                llm=self.llm,
+                system_prompt=self.system_prompt,
+            )
+            return HeadResult(
+                name=head.name,
+                title=head.title,
+                output=ensemble.run(
+                    topic=topic,
+                    evidence_context=evidence_context,
+                    input_mode=input_mode,
+                ),
+            )
+
         user_prompt = f"""
 Topic: {topic or "None"}
 
