@@ -84,7 +84,6 @@ class SearchAgentConfig:
     glm_search_content_size: str = "medium"
     glm_search_domain_filter: str | None = None
     search_proxy: str | None = None
-    ddgs_proxy: str | None = None
     context_proxy: str | None = None
     search_max_results: int = 5
     news_max_results: int = 5
@@ -774,20 +773,19 @@ class WebSearchAgent:
 
     def _open_ddgs(self):
         candidates: list[dict[str, Any]] = []
-        ddgs_proxy = self.config.ddgs_proxy or self.config.search_proxy
-        if ddgs_proxy:
+        if self.config.search_proxy:
             candidates.extend(
                 [
                     {
-                        "proxy": ddgs_proxy,
+                        "proxy": self.config.search_proxy,
                         "timeout": self.config.search_timeout,
                     },
                     {
-                        "proxies": ddgs_proxy,
+                        "proxies": self.config.search_proxy,
                         "timeout": self.config.search_timeout,
                     },
-                    {"proxy": ddgs_proxy},
-                    {"proxies": ddgs_proxy},
+                    {"proxy": self.config.search_proxy},
+                    {"proxies": self.config.search_proxy},
                 ]
             )
         candidates.extend([{"timeout": self.config.search_timeout}, {}])

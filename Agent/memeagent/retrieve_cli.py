@@ -103,9 +103,6 @@ def build_search_config(
         tavily_api_key=config.tavily_api_key,
         zhihu_api_key=config.zhihu_api_key,
         anspire_api_key=config.anspire_api_key,
-        qwen_search_api_key=config.qwen_search_api_key,
-        qwen_search_base_url=config.qwen_search_base_url,
-        qwen_search_model=config.qwen_search_model,
         glm_search_api_key=config.glm_search_api_key,
         glm_search_engine=config.glm_search_engine,
         glm_search_recency_filter=config.glm_search_recency_filter,
@@ -367,12 +364,6 @@ def _apply_overrides(config: MemeAgentConfig, args: argparse.Namespace) -> MemeA
         overrides["zhihu_api_key"] = args.zhihu_api_key.strip() or None
     if args.anspire_api_key is not None:
         overrides["anspire_api_key"] = args.anspire_api_key.strip() or None
-    if args.qwen_search_api_key is not None:
-        overrides["qwen_search_api_key"] = args.qwen_search_api_key.strip() or None
-    if args.qwen_search_model is not None:
-        overrides["qwen_search_model"] = args.qwen_search_model.strip()
-    if args.qwen_search_base_url is not None:
-        overrides["qwen_search_base_url"] = args.qwen_search_base_url.strip()
     if args.glm_search_api_key is not None:
         overrides["glm_search_api_key"] = args.glm_search_api_key.strip() or None
     if args.glm_search_engine is not None:
@@ -465,15 +456,12 @@ def parse_args() -> argparse.Namespace:
         "--provider",
         dest="search_provider",
         default=None,
-        help="Search provider: ddgs, tavily, zhihu, anspire, qwen, glm, or comma-separated combinations.",
+        help="Search provider: ddgs, tavily, zhihu, anspire, glm, or comma-separated combinations.",
     )
     parser.add_argument("--search-api-key", default=None)
     parser.add_argument("--tavily-api-key", default=None)
     parser.add_argument("--zhihu-api-key", default=None)
     parser.add_argument("--anspire-api-key", default=None)
-    parser.add_argument("--qwen-search-api-key", default=None)
-    parser.add_argument("--qwen-search-model", default=None)
-    parser.add_argument("--qwen-search-base-url", default=None)
     parser.add_argument("--glm-search-api-key", default=None)
     parser.add_argument("--glm-search-engine", default=None)
     parser.add_argument("--glm-search-recency-filter", default=None)

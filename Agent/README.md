@@ -257,21 +257,6 @@ without changing your default provider:
 python retrieve_anspire_demo.py --topic "meme sentiment analysis" --max-results 3
 ```
 
-To use Qwen/DashScope's built-in model search as the MemeAgent retrieval
-provider:
-
-```bash
-MEMEAGENT_SEARCH_PROVIDER=qwen
-DASHSCOPE_API_KEY=your_dashscope_api_key
-MEMEAGENT_QWEN_SEARCH_MODEL=qwen3.7-plus
-MEMEAGENT_QWEN_SEARCH_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-```
-
-This calls the OpenAI-compatible chat endpoint with `enable_search=true`.
-When DashScope returns source/citation metadata, MemeAgent normalizes it as
-search results; otherwise it uses the searched model answer as a cited retrieval
-summary.
-
 To use GLM/Zhipu's web search API:
 
 ```bash

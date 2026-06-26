@@ -362,53 +362,6 @@ class SearchRetrievalTests(unittest.TestCase):
         self.assertEqual(normalized["content_type"], "Article")
         self.assertEqual(normalized["content_id"], "123")
 
-    def test_qwen_search_uses_enable_search_and_normalizes_content(self) -> None:
-        class FakeResponse:
-            def raise_for_status(self) -> None:
-                return None
-
-            def json(self) -> dict[str, object]:
-                return {
-                    "choices": [
-                        {
-                            "message": {
-                                "content": "杭州明天天气摘要",
-                            }
-                        }
-                    ]
-                }
-
-        calls: list[dict[str, object]] = []
-
-        def fake_post(*args: object, **kwargs: object) -> FakeResponse:
-            calls.append({"args": args, "kwargs": kwargs})
-            return FakeResponse()
-
-        original_post = search_agent_module.requests.post
-        search_agent_module.requests.post = fake_post
-        try:
-            agent = WebSearchAgent(
-                SearchAgentConfig(
-                    search_provider="qwen",
-                    qwen_search_api_key="dashscope-key",
-                    qwen_search_model="qwen-plus",
-                    cache_enabled=False,
-                )
-            )
-            results = agent._search_text_provider_uncached("qwen", "杭州明天天气如何")
-        finally:
-            search_agent_module.requests.post = original_post
-
-        request_kwargs = calls[0]["kwargs"]
-        payload = request_kwargs["json"]
-
-        self.assertEqual(1, len(results))
-        self.assertEqual("Qwen search answer: 杭州明天天气如何", results[0]["title"])
-        self.assertEqual("杭州明天天气摘要", results[0]["body"])
-        self.assertEqual("Qwen Search", results[0]["source"])
-        self.assertEqual("qwen-plus", payload["model"])
-        self.assertTrue(payload["enable_search"])
-
     def test_glm_search_invokes_zai_client_and_normalizes_results(self) -> None:
         class FakeWebSearch:
             def __init__(self) -> None:
@@ -536,7 +489,7 @@ class SearchRetrievalTests(unittest.TestCase):
 
         agent = SlowProviderAgent(
             SearchAgentConfig(
-                search_provider="ddgs,qwen",
+                search_provider="ddgs,glm",
                 search_timeout=2,
                 cache_enabled=False,
             )

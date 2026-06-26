@@ -63,7 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--search-provider",
         default=None,
-        help="Override search provider. Supported values include ddgs, tavily, zhihu, anspire, qwen, glm, or comma-separated combinations.",
+        help="Override search provider. Supported values include ddgs, tavily, zhihu, anspire, glm, or comma-separated combinations.",
     )
     parser.add_argument(
         "--search-api-key",
@@ -84,16 +84,6 @@ def parse_args() -> argparse.Namespace:
         "--anspire-api-key",
         default=None,
         help="Override Anspire search API key.",
-    )
-    parser.add_argument(
-        "--qwen-search-model",
-        default=None,
-        help="Override Qwen model used for built-in search, for example qwen-plus.",
-    )
-    parser.add_argument(
-        "--qwen-search-base-url",
-        default=None,
-        help="Override Qwen OpenAI-compatible base URL.",
     )
     parser.add_argument(
         "--glm-search-engine",
@@ -232,10 +222,6 @@ def main() -> None:
         search_overrides["zhihu_api_key"] = args.zhihu_api_key.strip() or None
     if args.anspire_api_key is not None:
         search_overrides["anspire_api_key"] = args.anspire_api_key.strip() or None
-    if args.qwen_search_model is not None:
-        search_overrides["qwen_search_model"] = args.qwen_search_model.strip()
-    if args.qwen_search_base_url is not None:
-        search_overrides["qwen_search_base_url"] = args.qwen_search_base_url.strip()
     if args.glm_search_engine is not None:
         search_overrides["glm_search_engine"] = args.glm_search_engine.strip()
     if args.glm_search_domain_filter is not None:
@@ -298,9 +284,6 @@ def main() -> None:
             tavily_api_key=config.tavily_api_key,
             zhihu_api_key=config.zhihu_api_key,
             anspire_api_key=config.anspire_api_key,
-            qwen_search_api_key=config.qwen_search_api_key,
-            qwen_search_base_url=config.qwen_search_base_url,
-            qwen_search_model=config.qwen_search_model,
             glm_search_api_key=config.glm_search_api_key,
             glm_search_engine=config.glm_search_engine,
             glm_search_recency_filter=config.glm_search_recency_filter,

@@ -11,7 +11,7 @@ from memeagent.search_agent import SearchAgentConfig, WebSearchAgent
 
 
 ProviderCheck = Callable[[WebSearchAgent, str], list[dict[str, object]]]
-DEFAULT_PROVIDERS = ("zhihu", "anspire", "qwen", "glm", "ddgs", "tavily")
+DEFAULT_PROVIDERS = ("zhihu", "anspire", "glm", "ddgs", "tavily")
 
 
 def _clip(value: object, max_chars: int = 100) -> str:
@@ -29,9 +29,6 @@ def _build_agent(config: MemeAgentConfig, provider: str, max_results: int) -> We
             tavily_api_key=config.tavily_api_key,
             zhihu_api_key=config.zhihu_api_key,
             anspire_api_key=config.anspire_api_key,
-            qwen_search_api_key=config.qwen_search_api_key,
-            qwen_search_base_url=config.qwen_search_base_url,
-            qwen_search_model=config.qwen_search_model,
             glm_search_api_key=config.glm_search_api_key,
             glm_search_engine=config.glm_search_engine,
             glm_search_recency_filter=config.glm_search_recency_filter,
@@ -85,14 +82,6 @@ def _check_anspire_news(agent: WebSearchAgent, query: str) -> list[dict[str, obj
     return agent._search_anspire(query + " news", agent.config.news_max_results)
 
 
-def _check_qwen(agent: WebSearchAgent, query: str) -> list[dict[str, object]]:
-    return agent._search_qwen(query, agent.config.search_max_results)
-
-
-def _check_qwen_news(agent: WebSearchAgent, query: str) -> list[dict[str, object]]:
-    return agent._search_qwen(query, agent.config.news_max_results, news=True)
-
-
 def _check_glm(agent: WebSearchAgent, query: str) -> list[dict[str, object]]:
     return agent._search_glm(query, agent.config.search_max_results)
 
@@ -110,10 +99,6 @@ def _print_config(config: MemeAgentConfig) -> None:
     print(f"tavily_api_key: {'set' if config.tavily_api_key or config.search_api_key else 'missing'}")
     print(f"zhihu_api_key: {'set' if config.zhihu_api_key or config.search_api_key else 'missing'}")
     print(f"anspire_api_key: {'set' if config.anspire_api_key or config.search_api_key else 'missing'}")
-    print(
-        "qwen_search_key: "
-        f"{'set' if config.qwen_search_api_key or config.search_api_key else 'env/default'}"
-    )
     print(
         "glm_search_key: "
         f"{'set' if config.glm_search_api_key or config.search_api_key else 'env/default'}"
@@ -170,10 +155,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--providers",
         default=",".join(DEFAULT_PROVIDERS),
-        help=(
-            "Comma-separated providers to test, or 'all'. "
-            "Supported: zhihu, anspire, qwen, glm, ddgs, tavily."
-        ),
+        help=("Comma-separated providers to test, or 'all'. Supported: zhihu, anspire, glm, ddgs, tavily."),
     )
     parser.add_argument(
         "--max-results",
@@ -210,7 +192,6 @@ def main() -> int:
         "zhihu": _check_zhihu,
         "tavily": _check_tavily,
         "anspire": _check_anspire,
-        "qwen": _check_qwen,
         "glm": _check_glm,
         "zai": _check_glm,
         "zhipu": _check_glm,
@@ -219,7 +200,6 @@ def main() -> int:
         "ddgs": _check_ddgs_news,
         "tavily": _check_tavily_news,
         "anspire": _check_anspire_news,
-        "qwen": _check_qwen_news,
         "glm": _check_glm_news,
         "zai": _check_glm_news,
         "zhipu": _check_glm_news,
