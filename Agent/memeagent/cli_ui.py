@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import sys
+import time
 from typing import Any
 
 try:
@@ -38,16 +39,24 @@ class RunSummary:
 class MemeAgentCLI:
     """Terminal presentation helpers with a plain-text fallback."""
 
-    def __init__(self, enabled: bool = True, stream_markdown: bool = False) -> None:
+    def __init__(
+        self,
+        enabled: bool = True,
+        stream_markdown: bool = False,
+        trace_mode: str = "live",
+    ) -> None:
         self._configure_text_streams()
         self.enabled = enabled and Console is not None
         self.stream_markdown = stream_markdown and self.enabled
+        self.trace_mode = trace_mode
         self.console = Console() if self.enabled else None
         self._progress: Any = None
         self._live: Any = None
         self._task_id: Any = None
         self._stream_live: Any = None
         self._stream_text = ""
+        self._activity_started_at = 0.0
+        self._activity_events: list[tuple[str, str, float]] = []
 
     def _configure_text_streams(self) -> None:
         for stream in (sys.stdout, sys.stderr):
@@ -103,17 +112,18 @@ class MemeAgentCLI:
         )
 
     def start_activity(self) -> None:
-        if not self.enabled:
+        if not self.enabled or self.trace_mode == "off":
             return
 
-        self._progress = Progress(
-            SpinnerColumn(style="cyan"),
-            TextColumn("[bold cyan]{task.description}"),
-            TimeElapsedColumn(),
+        self._activity_started_at = time.monotonic()
+        self._activity_events = []
+        self._record_activity_event("start", "Preparing request...")
+        self._live = Live(
+            self._render_activity_panel(),
+            console=self.console,
+            refresh_per_second=6,
             transient=False,
         )
-        self._task_id = self._progress.add_task("Preparing request...", total=None)
-        self._live = Live(self._progress, console=self.console, refresh_per_second=8)
         self._live.start()
 
     def update(self, stage: str, message: str) -> None:
@@ -122,15 +132,64 @@ class MemeAgentCLI:
             print(label)
             return
 
-        if self._progress is not None and self._task_id is not None:
-            self._progress.update(self._task_id, description=label)
+        self._record_activity_event(stage, message)
+        if self._live is not None:
+            self._live.update(self._render_activity_panel())
+
+    def _record_activity_event(self, stage: str, message: str) -> None:
+        elapsed = max(0.0, time.monotonic() - self._activity_started_at)
+        self._activity_events.append((stage, message, elapsed))
+        self._activity_events = self._activity_events[-12:]
+
+    def _render_activity_panel(self) -> Any:
+        if not self._activity_events:
+            body = "Preparing request..."
+            return Panel(body, title="MemeAgent Workflow", border_style="cyan")
+
+        stage_styles = {
+            "start": "cyan",
+            "input": "cyan",
+            "memory": "blue",
+            "vision": "magenta",
+            "planning": "yellow",
+            "controller": "yellow",
+            "search": "green",
+            "reflection": "yellow",
+            "analysis": "green",
+            "heads": "green",
+        }
+        current_stage, current_message, current_elapsed = self._activity_events[-1]
+        lines = [
+            f"Elapsed: [bold]{current_elapsed:5.1f}s[/bold]",
+            (
+                "Current: "
+                f"[bold {stage_styles.get(current_stage, 'white')}]{current_stage}[/] "
+                f"{current_message}"
+            ),
+            "",
+            "[bold]Workflow timeline[/bold]",
+        ]
+        for index, (stage, message, elapsed) in enumerate(self._activity_events, start=1):
+            style = stage_styles.get(stage, "white")
+            lines.append(
+                f"{index:02d}. [dim]{elapsed:5.1f}s[/dim] "
+                f"[{style}]{stage:<10}[/{style}] {message}"
+            )
+        return Panel(
+            "\n".join(lines),
+            title="MemeAgent Workflow",
+            border_style="cyan",
+        )
 
     def stop_activity(self) -> None:
         if self._live is not None:
             self._live.stop()
+            if self.trace_mode == "live" and self.console is not None:
+                self.console.clear()
         self._live = None
         self._progress = None
         self._task_id = None
+        self._activity_events = []
 
     def start_stream(self) -> None:
         self._stream_text = ""
@@ -186,6 +245,7 @@ class MemeAgentCLI:
         search_report: str = "",
         visual_report: str = "",
         retrieval_plan: str = "",
+        controller_report: str = "",
         show_search: bool = False,
         analysis_title: str = "Final Analysis",
     ) -> None:
@@ -198,6 +258,9 @@ class MemeAgentCLI:
                 if retrieval_plan:
                     print("\n=== Supplemental Retrieval Plan ===")
                     print(retrieval_plan)
+                if controller_report:
+                    print("\n=== Controller Planning Report ===")
+                    print(controller_report)
                 print("\n=== Search Report ===")
                 print(search_report)
                 if analysis:
@@ -221,6 +284,14 @@ class MemeAgentCLI:
                     Panel(
                         Markdown(retrieval_plan),
                         title="Supplemental Retrieval Plan",
+                        border_style="yellow",
+                    )
+                )
+            if controller_report:
+                self.console.print(
+                    Panel(
+                        Markdown(controller_report),
+                        title="Controller Planning Report",
                         border_style="yellow",
                     )
                 )

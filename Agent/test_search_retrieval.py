@@ -502,6 +502,42 @@ class SearchRetrievalTests(unittest.TestCase):
         self.assertEqual(2, len(results))
         self.assertLess(elapsed, 0.35)
 
+    def test_slow_provider_does_not_block_fast_provider_results(self) -> None:
+        class MixedSpeedProviderAgent(WebSearchAgent):
+            def _search_text_provider(
+                self,
+                provider: str,
+                query: str,
+            ) -> list[dict[str, object]]:
+                if provider == "slow":
+                    time.sleep(1.0)
+                    return []
+                return [
+                    {
+                        "title": f"{provider} {query}",
+                        "body": "fast snippet",
+                        "href": f"https://example.com/{provider}/{query}",
+                    }
+                ]
+
+            def _search_providers(self) -> list[str]:
+                return ["fast", "slow"]
+
+        agent = MixedSpeedProviderAgent(
+            SearchAgentConfig(
+                search_timeout=0.15,
+                cache_enabled=False,
+            )
+        )
+
+        started = time.perf_counter()
+        results = agent._search_text_queries(["q1", "q2"])
+        elapsed = time.perf_counter() - started
+
+        self.assertEqual(2, len(results))
+        self.assertTrue(all("fast" in item["title"] for item in results))
+        self.assertLess(elapsed, 0.5)
+
 
 if __name__ == "__main__":
     unittest.main()

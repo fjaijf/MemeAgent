@@ -7,6 +7,8 @@ from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from .rubrics import CONTROLLER_OUTPUT_SCHEMA, MEME_ANALYSIS_RUBRIC
+
 
 def _normalize_content(content: Any) -> str:
     if isinstance(content, str):
@@ -167,69 +169,129 @@ QUERY_CAUTIONS:
         response = self.llm.invoke(messages)
         return _normalize_content(getattr(response, "content", response))
 
-    def decide_retrieval(
+    def plan_analysis_iteration(
         self,
         topic: str = "",
         context: str = "",
         visual_report: str = "",
-        memory_report: str = "",
+        search_report: str = "",
+        iteration_history: str = "",
         input_mode: str = "text_only",
+        round_index: int = 1,
+        max_rounds: int = 3,
+        confidence_threshold: float = 0.8,
     ) -> str:
         user_prompt = f"""
 Topic hint: {topic or "None"}
 
 Input mode: {input_mode}
 
-User-provided context:
+Current controller round: {round_index} of {max_rounds}
+Finalization threshold: {confidence_threshold:.2f}
+
+Project rubric:
+{MEME_ANALYSIS_RUBRIC}
+
+User/context evidence:
 {context or "None"}
 
-Local MemeAgent memory:
-{memory_report or "None"}
-
-Image-derived visual report:
+Latest multimodal image analysis:
 {visual_report or "None"}
 
-Decide whether MemeAgent needs external web/news retrieval before final meme analysis.
-Use local memory and the provided image/text evidence first. Retrieval is optional.
+Latest/cumulative retrieval evidence:
+{search_report or "None"}
 
-Choose RETRIEVAL_NEEDED: no when:
-- the user asks for general interpretation, translation, OCR-based analysis, or reasoning that can be done from the given evidence
-- local memory already contains enough relevant prior analysis
-- there are no concrete searchable anchors such as names, exact phrases, events, places, platforms, organizations, or dates
+Previous controller and multimodal iteration history:
+{iteration_history or "None"}
 
-Choose RETRIEVAL_NEEDED: yes only when retrieval can answer concrete evidence questions, such as:
-- identifying the original post, platform context, meme template, source event, public figure, controversy, or exact OCR phrase
-- checking whether a claim, event, screenshot, or quoted text refers to real public context
-- resolving an evidence gap that materially affects harmfulness, intent, target, or reception analysis
+You are the controller model for MemeAgent. Your role is to plan the next
+analysis step under the project rubric, not to write the final answer unless
+the evidence is already sufficient. Evaluate harmfulness, sentiment, audience,
+intent, and evolution coverage. If confidence is below threshold, produce
+concrete questions/instructions for the multimodal model and concrete retrieval
+queries. If confidence is at or above threshold, set SHOULD_FINALIZE to yes and
+keep follow-up requests as None.
+The workflow will stop when ITERATION_CONFIDENCE is at or above the threshold.
 
 Rules:
-- Do not invent entities or events not supported by the input.
-- If retrieval is needed, propose only concrete, short queries.
-- If memory is sufficient, say so and do not propose queries.
+- Use the user's harmfulness criteria strictly, especially that any reference to sensitive events is offensive.
+- Ask for image re-analysis when visual/OCR evidence is ambiguous or when harm/sentiment/intent/evolution cues need closer inspection.
+- Ask for retrieval when source event, template, platform context, audience boundary, or evolution lineage needs external evidence.
+- Do not invent entities, events, platforms, dates, or source IDs.
+- The confidence score must reflect evidence sufficiency, not how plausible your current guess feels.
 
-Return exactly these sections:
-RETRIEVAL_NEEDED:
-- yes or no
-
-DECISION_REASON:
-- One concise sentence.
-
-EVIDENCE_QUESTIONS:
-- 0-4 concrete questions retrieval should answer. Use "None" if retrieval is not needed.
-
-SUPPLEMENTAL_WEB_QUERIES:
-- 0-4 short queries. Use "None" if retrieval is not needed.
-
-SUPPLEMENTAL_NEWS_QUERIES:
-- 0-2 short news-friendly queries. Use "None" if retrieval is not needed.
-
-QUERY_CAUTIONS:
-- 1-3 cautions about what should not be assumed without evidence.
+{CONTROLLER_OUTPUT_SCHEMA}
 """.strip()
 
         messages = [
             SystemMessage(content=self.system_prompt),
             HumanMessage(content=user_prompt),
+        ]
+        response = self.llm.invoke(messages)
+        return _normalize_content(getattr(response, "content", response))
+
+    def analyze_images_for_plan(
+        self,
+        topic: str = "",
+        context: str = "",
+        controller_plan: str = "",
+        previous_visual_report: str = "",
+        image_paths: list[str] | None = None,
+        image_urls: list[str] | None = None,
+    ) -> str:
+        image_paths = image_paths or []
+        image_urls = image_urls or []
+        if not image_paths and not image_urls:
+            return ""
+
+        user_prompt = f"""
+Topic hint: {topic or "None"}
+
+User/context evidence:
+{context or "None"}
+
+Previous image analysis:
+{previous_visual_report or "None"}
+
+Controller plan and focus questions:
+{controller_plan or "None"}
+
+Project rubric:
+{MEME_ANALYSIS_RUBRIC}
+
+Re-examine the attached meme image(s) in detail according to the controller's
+focus questions. This is not the final report. Provide image-grounded evidence
+that can be fed back to the controller and retrieval system.
+
+Return these sections:
+1. OCR and text verification:
+   - exact visible text, language, spelling, placement, and uncertain characters.
+2. Focus-question answers:
+   - answer each controller question using visible evidence; say "not visible" when unsupported.
+3. Harmfulness cues:
+   - discrimination, offensive sensitive-event references, violence, vulgarity, antagonism.
+4. Sentiment cues:
+   - Joy, Sadness, Anger, Disgust, Fear, Surprise, including multimodal mismatch.
+5. Audience and intent cues:
+   - Gemeinschaft/Gesellschaft signals and Teleological/Normative/Dramaturgical/Communicative intent evidence.
+6. Evolution/template cues:
+   - template, visual drift, kernel fidelity, lifecycle hints, intertextual splicing.
+7. Search anchors:
+   - exact OCR phrases, names, symbols, platforms, template names, events, and 3-8 concrete search queries.
+
+Separate visible evidence from inference. Do not invent unsupported identities,
+events, platforms, dates, or source URLs.
+""".strip()
+
+        messages = [
+            SystemMessage(content=self.system_prompt),
+            HumanMessage(
+                content=self._build_user_content_with_images(
+                    user_prompt,
+                    image_paths,
+                    image_urls,
+                )
+            ),
         ]
         response = self.llm.invoke(messages)
         return _normalize_content(getattr(response, "content", response))
@@ -388,6 +450,9 @@ Extra context:
 Please produce a researcher-oriented meme analysis in Chinese unless the user asks otherwise.
 Do not frame the topic as crypto, finance, or market speculation unless the topic or evidence explicitly requires it.
 
+Project-specific analysis rubric:
+{MEME_ANALYSIS_RUBRIC}
+
 Evidence citation rules:
 - Cite evidence for every important claim using source tags.
 - Use [Image] for visible image/OCR evidence.
@@ -411,26 +476,32 @@ Required sections:
    - Confidence:
    - Uncertainty:
 3. Sentiment analysis
+   - Use exactly one primary label from Joy, Sadness, Anger, Disgust, Fear, Surprise, plus optional secondary labels.
    - Claim:
    - Evidence:
    - Confidence:
    - Uncertainty:
 4. Harmfulness analysis
+   - Apply the harmfulness labels Discrimination, Offensive, Violence, Vulgar, Antagonism; multiple labels are allowed.
+   - Treat any reference to sensitive events as Offensive according to the project rubric.
    - Claim:
    - Evidence:
    - Confidence:
    - Uncertainty:
 5. Audience and reception prediction
+   - Classify audience as Gemeinschaft-oriented, Gesellschaft-oriented, or mixed/uncertain.
    - Claim:
    - Evidence:
    - Confidence:
    - Uncertainty:
 6. Intent recognition
+   - Classify intent as Teleological, Normative, Dramaturgical, Communicative, or mixed/uncertain.
    - Claim:
    - Evidence:
    - Confidence:
    - Uncertainty:
 7. Evolution tracking
+   - Address phylogenetic/mutation cues, invariant kernel, lifecycle phase, and intertextual splicing when evidence allows.
    - Claim:
    - Evidence:
    - Confidence:

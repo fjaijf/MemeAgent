@@ -70,8 +70,8 @@ MEMEAGENT_TIMEOUT=180
 MEMEAGENT_MAX_TOKENS=1200
 ```
 
-To use GLM as a separate controller for planning, retrieval decisions, and
-retrieval reflection while keeping the primary model for vision/final analysis:
+To use GLM as a separate controller for retrieval planning and retrieval
+reflection while keeping the primary model for vision/final analysis:
 
 ```bash
 MEMEAGENT_PROVIDER=openai-compatible
@@ -110,13 +110,14 @@ pip install -e ".[local]"
 pip install -r requirements-local.txt
 ```
 
-To allow MemeAgent to decide whether public web/news retrieval is needed:
+MemeAgent runs public web/news retrieval before analysis by default:
 
 ```bash
 python main.py --topic "PEPE" --search --show-search
 ```
 
-To bypass that retrieval-needed decision and force web/news retrieval:
+The legacy `--force-search` flag is still accepted and has the same forced
+retrieval behavior:
 
 ```bash
 python main.py --topic "PEPE" --force-search --show-search
@@ -138,11 +139,21 @@ If installed with `pip install -e .`, the same tool is available as:
 meme-retrieve --topic "PEPE" --mode both
 ```
 
-The CLI shows a terminal status panel and live activity indicator while it waits
-for image pre-analysis, retrieval, and final LLM analysis. For plain text output
-in logs or batch jobs, add:
+The CLI shows a live workflow timeline while it waits for image pre-analysis,
+controller planning, confidence scoring, follow-up image analysis, retrieval,
+and final LLM analysis. It displays auditable planning summaries and progress
+events, not hidden chain-of-thought text. For plain text output in logs or batch
+jobs, add:
 
 ```bash
+python main.py --image path/to/meme.png --trace-mode live
+```
+
+`--trace-mode live` shows the trace only while the workflow is running and clears
+it before printing the final output. To disable the live trace:
+
+```bash
+python main.py --topic "PEPE" --trace-mode off
 python main.py --topic "PEPE" --search --show-search --plain
 ```
 
@@ -173,6 +184,18 @@ python main.py --image path/to/meme.png --search --show-search
 python main.py --topic "a meme name or phrase" --image path/to/meme.png --search --show-search
 ```
 
+After the initial QwenVL image pass and forced retrieval, MemeAgent uses the
+controller model to plan rubric-driven follow-up analysis. The controller checks
+harmfulness, sentiment, audience, intent, and evolution coverage, emits
+`ITERATION_CONFIDENCE`, and asks for more image analysis or retrieval when the
+score is below the threshold. The default threshold is `0.8`:
+
+```bash
+python main.py --image path/to/meme.png --show-search \
+  --controller-confidence-threshold 0.8 \
+  --controller-max-rounds 3
+```
+
 ## Evaluation Script
 
 For harmful meme detection benchmarks, use the dedicated evaluator:
@@ -200,13 +223,11 @@ as additional search context before the final meme analysis:
 python main.py --image path/to/meme.png --search --show-search
 ```
 
-When `--search` is enabled, MemeAgent first asks the LLM whether external
-retrieval is needed. It can skip web/news retrieval when the input and local
-memory are already sufficient. When `--force-search` is enabled, MemeAgent skips
-that decision and directly plans retrieval queries before searching. The stable
-OCR/visual-anchor queries remain the primary search inputs; the LLM plan can add
-only a few extra web/news queries when the input provides concrete people,
-events, OCR phrases, platforms, or background clues.
+Before final analysis, MemeAgent always plans and runs external web/news
+retrieval. The stable OCR/visual-anchor queries remain the primary search inputs;
+the controller can add follow-up web/news queries when the input provides
+concrete people, events, OCR phrases, platforms, sensitive-event clues, or
+template/evolution anchors.
 
 The search agent currently gathers research context for:
 

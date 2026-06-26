@@ -22,6 +22,7 @@ class WorkflowResult:
     combined_context: str
     visual_report: str = ""
     retrieval_plan: str = ""
+    controller_report: str = ""
     memory_report: str = ""
     input_mode: str = "text_only"
 
@@ -34,6 +35,7 @@ class MultiHeadWorkflowResult:
     combined_context: str
     visual_report: str = ""
     retrieval_plan: str = ""
+    controller_report: str = ""
     memory_report: str = ""
     input_mode: str = "text_only"
 
@@ -145,63 +147,221 @@ class MemeResearchWorkflow:
             )
         )
 
-    def _retrieval_decision_needs_search(self, retrieval_decision: str) -> bool:
+    def _controller_confidence(self, controller_plan: str) -> float:
         match = re.search(
-            r"RETRIEVAL_NEEDED\s*:\s*(?:[-*]\s*)?(yes|no)\b",
-            retrieval_decision,
+            r"ITERATION_CONFIDENCE\s*:\s*(?:[-*]\s*)?([01](?:\.\d+)?)",
+            controller_plan,
             flags=re.I,
         )
-        if match:
-            return match.group(1).lower() == "yes"
-        return True
+        if not match:
+            return 0.0
+        try:
+            return max(0.0, min(1.0, float(match.group(1))))
+        except ValueError:
+            return 0.0
+
+    def _controller_should_finalize(
+        self,
+        controller_plan: str,
+        confidence_threshold: float,
+    ) -> bool:
+        return self._controller_confidence(controller_plan) >= confidence_threshold
 
     def _prepare_retrieval_plan(
         self,
         topic: str,
         context: str,
         visual_report: str,
-        memory_report: str,
         input_mode: str,
-        force_search: bool,
         progress: Callable[[str, str], None] | None,
-    ) -> tuple[str, bool, str]:
-        if force_search:
-            self._emit_progress(
-                progress,
-                "planning",
-                "Force search enabled; planning retrieval queries.",
-            )
-            try:
-                retrieval_plan = self.controller_agent.plan_retrieval(
-                    topic=topic,
-                    context=context,
-                    visual_report=visual_report,
-                    input_mode=input_mode,
-                )
-            except Exception as exc:
-                raise RuntimeError("Forced retrieval planning LLM call failed.") from exc
-            return retrieval_plan, True, "Forced retrieval plan"
-
+    ) -> tuple[str, str]:
         self._emit_progress(
             progress,
             "planning",
-            "Deciding whether external retrieval is needed.",
+            "Planning forced retrieval queries.",
         )
         try:
-            retrieval_plan = self.controller_agent.decide_retrieval(
+            retrieval_plan = self.controller_agent.plan_retrieval(
                 topic=topic,
                 context=context,
                 visual_report=visual_report,
-                memory_report=memory_report,
                 input_mode=input_mode,
             )
         except Exception as exc:
-            raise RuntimeError("Retrieval decision LLM call failed.") from exc
-        return (
-            retrieval_plan,
-            self._retrieval_decision_needs_search(retrieval_plan),
-            "Retrieval decision and query plan",
+            raise RuntimeError("Retrieval planning LLM call failed.") from exc
+        return retrieval_plan, "Forced retrieval plan"
+
+    def _plan_analysis_iteration(
+        self,
+        topic: str,
+        context: str,
+        visual_report: str,
+        search_report: str,
+        iteration_history: str,
+        input_mode: str,
+        round_index: int,
+        max_rounds: int,
+        confidence_threshold: float,
+        progress: Callable[[str, str], None] | None,
+    ) -> str:
+        self._emit_progress(
+            progress,
+            "controller",
+            f"Planning analysis round {round_index}.",
         )
+        try:
+            return self.controller_agent.plan_analysis_iteration(
+                topic=topic,
+                context=context,
+                visual_report=visual_report,
+                search_report=search_report,
+                iteration_history=iteration_history,
+                input_mode=input_mode,
+                round_index=round_index,
+                max_rounds=max_rounds,
+                confidence_threshold=confidence_threshold,
+            )
+        except Exception as exc:
+            raise RuntimeError("Controller analysis planning LLM call failed.") from exc
+
+    def _analyze_images_for_controller_plan(
+        self,
+        topic: str,
+        context: str,
+        controller_plan: str,
+        previous_visual_report: str,
+        image_paths: list[str],
+        image_urls: list[str],
+        progress: Callable[[str, str], None] | None,
+    ) -> str:
+        if not image_paths and not image_urls:
+            return ""
+
+        self._emit_progress(progress, "vision", "Re-examining image content for controller questions.")
+        try:
+            return self.meme_agent.analyze_images_for_plan(
+                topic=topic,
+                context=context,
+                controller_plan=controller_plan,
+                previous_visual_report=previous_visual_report,
+                image_paths=image_paths,
+                image_urls=image_urls,
+            )
+        except Exception as exc:
+            raise RuntimeError("Image follow-up analysis LLM call failed.") from exc
+
+    def _run_controller_analysis_loop(
+        self,
+        topic: str,
+        context: str,
+        visual_report: str,
+        search_report: str,
+        input_mode: str,
+        image_paths: list[str],
+        image_urls: list[str],
+        max_rounds: int,
+        confidence_threshold: float,
+        progress: Callable[[str, str], None] | None,
+    ) -> tuple[str, str, str]:
+        max_rounds = max(1, max_rounds)
+        round_blocks: list[str] = []
+        cumulative_visual_report = visual_report
+        cumulative_search_report = search_report
+
+        for round_index in range(1, max_rounds + 1):
+            iteration_history = "\n\n".join(round_blocks)
+            controller_plan = self._plan_analysis_iteration(
+                topic=topic,
+                context=context,
+                visual_report=cumulative_visual_report,
+                search_report=cumulative_search_report,
+                iteration_history=iteration_history,
+                input_mode=input_mode,
+                round_index=round_index,
+                max_rounds=max_rounds,
+                confidence_threshold=confidence_threshold,
+                progress=progress,
+            )
+            confidence = self._controller_confidence(controller_plan)
+            self._emit_progress(
+                progress,
+                "controller",
+                (
+                    f"Round {round_index} confidence {confidence:.2f}; "
+                    f"threshold {confidence_threshold:.2f}."
+                ),
+            )
+            round_blocks.append(
+                f"## Controller Round {round_index}\n\n"
+                f"{controller_plan}\n\n"
+                f"Parsed confidence: {confidence:.2f}"
+            )
+
+            if self._controller_should_finalize(controller_plan, confidence_threshold):
+                self._emit_progress(
+                    progress,
+                    "controller",
+                    f"Confidence {confidence:.2f} reached threshold {confidence_threshold:.2f}.",
+                )
+                break
+            if round_index >= max_rounds:
+                self._emit_progress(
+                    progress,
+                    "controller",
+                    f"Max controller rounds reached with confidence {confidence:.2f}.",
+                )
+                break
+
+            self._emit_progress(
+                progress,
+                "controller",
+                "Confidence below threshold; requesting follow-up image analysis and retrieval.",
+            )
+            followup_visual = self._analyze_images_for_controller_plan(
+                topic=topic,
+                context=context,
+                controller_plan=controller_plan,
+                previous_visual_report=cumulative_visual_report,
+                image_paths=image_paths,
+                image_urls=image_urls,
+                progress=progress,
+            )
+            if followup_visual:
+                cumulative_visual_report = (
+                    f"{cumulative_visual_report}\n\n"
+                    f"## Follow-up Image Analysis Round {round_index}\n\n"
+                    f"{followup_visual}"
+                ).strip()
+                round_blocks.append(
+                    f"## Follow-up Image Analysis Round {round_index}\n\n{followup_visual}"
+                )
+
+            self._emit_progress(
+                progress,
+                "search",
+                f"Collecting controller-directed retrieval round {round_index + 1}.",
+            )
+            followup_context = (
+                f"{context}\n\n"
+                f"Controller plan for round {round_index + 1}:\n{controller_plan}"
+            )
+            if followup_visual:
+                followup_context += f"\n\nFollow-up image analysis:\n{followup_visual}"
+            followup_report = self._label_search_report(
+                self.search_agent.run(topic=topic, context=followup_context),
+                round_index=round_index + 1,
+            )
+            cumulative_search_report = (
+                f"{cumulative_search_report}\n\n"
+                f"## Controller-Directed Retrieval Round {round_index + 1}\n\n"
+                f"{followup_report}"
+            ).strip()
+            round_blocks.append(
+                f"## Controller-Directed Retrieval Round {round_index + 1}\n\n"
+                f"{followup_report}"
+            )
+
+        return "\n\n".join(round_blocks), cumulative_visual_report, cumulative_search_report
 
     def _label_search_report(self, search_report: str, round_index: int) -> str:
         if round_index <= 1:
@@ -312,15 +472,18 @@ class MemeResearchWorkflow:
         progress: Callable[[str, str], None] | None = None,
         stream_analysis: bool = False,
         analysis_delta: Callable[[str], None] | None = None,
-        search_ready: Callable[[str, str, str, str], None] | None = None,
+        search_ready: Callable[[str, str, str, str, str], None] | None = None,
         iterative_search: bool = False,
         search_max_rounds: int = 3,
+        controller_max_rounds: int = 3,
+        controller_confidence_threshold: float = 0.8,
     ) -> WorkflowResult:
         image_paths = image_paths or []
         image_urls = image_urls or []
         search_report = ""
         visual_report = ""
         retrieval_plan = ""
+        controller_report = ""
         memory_report = ""
         combined_parts: list[str] = []
         input_mode = self._detect_input_mode(topic, context, image_paths, image_urls)
@@ -365,57 +528,67 @@ class MemeResearchWorkflow:
             except Exception as exc:
                 raise RuntimeError("Image pre-analysis LLM call failed.") from exc
             self._emit_progress(progress, "vision", "Image-derived search context ready.")
-            if visual_report:
-                combined_parts.append(
-                    "Image-derived meme description for retrieval and analysis:\n"
-                    + visual_report
-                )
 
-        if use_search or force_search:
-            retrieval_plan, should_search, plan_label = self._prepare_retrieval_plan(
-                topic=topic,
-                context=context,
-                visual_report=visual_report,
-                memory_report=memory_report,
-                input_mode=input_mode,
-                force_search=force_search,
-                progress=progress,
+        retrieval_plan, plan_label = self._prepare_retrieval_plan(
+            topic=topic,
+            context=context,
+            visual_report=visual_report,
+            input_mode=input_mode,
+            progress=progress,
+        )
+        if retrieval_plan:
+            combined_parts.append(f"{plan_label}:\n" + retrieval_plan)
+        self._emit_progress(progress, "planning", "External retrieval forced.")
+        search_report = self._run_search_with_reflection(
+            topic=topic,
+            context=context,
+            visual_report=visual_report,
+            retrieval_plan=retrieval_plan,
+            input_mode=input_mode,
+            iterative_search=iterative_search,
+            search_max_rounds=search_max_rounds,
+            progress=progress,
+        )
+
+        controller_report, visual_report, search_report = self._run_controller_analysis_loop(
+            topic=topic,
+            context=context,
+            visual_report=visual_report,
+            search_report=search_report,
+            input_mode=input_mode,
+            image_paths=image_paths,
+            image_urls=image_urls,
+            max_rounds=controller_max_rounds,
+            confidence_threshold=controller_confidence_threshold,
+            progress=progress,
+        )
+        if controller_report:
+            combined_parts.append(
+                "Controller planning and confidence report. Use these focus notes, "
+                "but still ground the final answer in source labels:\n"
+                + controller_report
             )
-            if retrieval_plan:
-                combined_parts.append(f"{plan_label}:\n" + retrieval_plan)
-            if should_search:
-                planning_message = (
-                    "External retrieval forced."
-                    if force_search
-                    else "External retrieval approved."
-                )
-                self._emit_progress(progress, "planning", planning_message)
-                search_report = self._run_search_with_reflection(
-                    topic=topic,
-                    context=context,
-                    visual_report=visual_report,
-                    retrieval_plan=retrieval_plan,
-                    input_mode=input_mode,
-                    iterative_search=iterative_search,
-                    search_max_rounds=search_max_rounds,
-                    progress=progress,
-                )
-                combined_parts.append(
-                    "Internet search findings. Cite source labels exactly as shown below. "
-                    "Single-round labels look like [W1] or [N1]; iterative retrieval may "
-                    "also include labels such as [R2-W1] or [R2-N1]:\n"
-                    + search_report
-                )
-            else:
-                self._emit_progress(
-                    progress,
-                    "planning",
-                    "External retrieval skipped by LLM decision.",
-                )
+        if visual_report:
+            combined_parts.append(
+                "Cumulative image analysis after controller-directed passes:\n"
+                + visual_report
+            )
+        if search_report:
+            combined_parts.append(
+                "Cumulative internet search findings after controller-directed passes. "
+                "Cite source labels exactly as shown:\n"
+                + search_report
+            )
 
         combined_context = "\n\n".join(part for part in combined_parts if part).strip()
         if search_ready:
-            search_ready(input_mode, search_report, visual_report, retrieval_plan)
+            search_ready(
+                input_mode,
+                search_report,
+                visual_report,
+                retrieval_plan,
+                controller_report,
+            )
         self._emit_progress(progress, "analysis", "Running final meme analysis.")
         try:
             if stream_analysis:
@@ -485,6 +658,7 @@ class MemeResearchWorkflow:
             combined_context=combined_context,
             visual_report=visual_report,
             retrieval_plan=retrieval_plan,
+            controller_report=controller_report,
             memory_report=memory_report,
             input_mode=input_mode,
         )
@@ -499,9 +673,11 @@ class MemeResearchWorkflow:
         use_search: bool = True,
         force_search: bool = False,
         progress: Callable[[str, str], None] | None = None,
-        search_ready: Callable[[str, str, str, str], None] | None = None,
+        search_ready: Callable[[str, str, str, str, str], None] | None = None,
         iterative_search: bool = False,
         search_max_rounds: int = 3,
+        controller_max_rounds: int = 3,
+        controller_confidence_threshold: float = 0.8,
     ) -> MultiHeadWorkflowResult:
         image_paths = image_paths or []
         image_urls = image_urls or []
@@ -509,6 +685,7 @@ class MemeResearchWorkflow:
         search_report = ""
         visual_report = ""
         retrieval_plan = ""
+        controller_report = ""
         memory_report = ""
         combined_parts: list[str] = []
         input_mode = self._detect_input_mode(topic, context, image_paths, image_urls)
@@ -553,57 +730,67 @@ class MemeResearchWorkflow:
             except Exception as exc:
                 raise RuntimeError("Image pre-analysis LLM call failed.") from exc
             self._emit_progress(progress, "vision", "Image-derived context ready.")
-            if visual_report:
-                combined_parts.append(
-                    "[Image]\nImage-derived meme description for retrieval and analysis:\n"
-                    + visual_report
-                )
 
-        if use_search or force_search:
-            retrieval_plan, should_search, plan_label = self._prepare_retrieval_plan(
-                topic=topic,
-                context=context,
-                visual_report=visual_report,
-                memory_report=memory_report,
-                input_mode=input_mode,
-                force_search=force_search,
-                progress=progress,
+        retrieval_plan, plan_label = self._prepare_retrieval_plan(
+            topic=topic,
+            context=context,
+            visual_report=visual_report,
+            input_mode=input_mode,
+            progress=progress,
+        )
+        if retrieval_plan:
+            combined_parts.append(f"{plan_label}:\n" + retrieval_plan)
+        self._emit_progress(progress, "planning", "External retrieval forced.")
+        search_report = self._run_search_with_reflection(
+            topic=topic,
+            context=context,
+            visual_report=visual_report,
+            retrieval_plan=retrieval_plan,
+            input_mode=input_mode,
+            iterative_search=iterative_search,
+            search_max_rounds=search_max_rounds,
+            progress=progress,
+        )
+
+        controller_report, visual_report, search_report = self._run_controller_analysis_loop(
+            topic=topic,
+            context=context,
+            visual_report=visual_report,
+            search_report=search_report,
+            input_mode=input_mode,
+            image_paths=image_paths,
+            image_urls=image_urls,
+            max_rounds=controller_max_rounds,
+            confidence_threshold=controller_confidence_threshold,
+            progress=progress,
+        )
+        if controller_report:
+            combined_parts.append(
+                "Controller planning and confidence report. Use these focus notes, "
+                "but still ground each task head in source labels:\n"
+                + controller_report
             )
-            if retrieval_plan:
-                combined_parts.append(f"{plan_label}:\n" + retrieval_plan)
-            if should_search:
-                planning_message = (
-                    "External retrieval forced."
-                    if force_search
-                    else "External retrieval approved."
-                )
-                self._emit_progress(progress, "planning", planning_message)
-                search_report = self._run_search_with_reflection(
-                    topic=topic,
-                    context=context,
-                    visual_report=visual_report,
-                    retrieval_plan=retrieval_plan,
-                    input_mode=input_mode,
-                    iterative_search=iterative_search,
-                    search_max_rounds=search_max_rounds,
-                    progress=progress,
-                )
-                combined_parts.append(
-                    "Internet search findings. Cite source labels exactly as shown below. "
-                    "Single-round labels look like [W1] or [N1]; iterative retrieval may "
-                    "also include labels such as [R2-W1] or [R2-N1]:\n"
-                    + search_report
-                )
-            else:
-                self._emit_progress(
-                    progress,
-                    "planning",
-                    "External retrieval skipped by LLM decision.",
-                )
+        if visual_report:
+            combined_parts.append(
+                "Cumulative image analysis after controller-directed passes:\n"
+                + visual_report
+            )
+        if search_report:
+            combined_parts.append(
+                "Cumulative internet search findings after controller-directed passes. "
+                "Cite source labels exactly as shown:\n"
+                + search_report
+            )
 
         combined_context = "\n\n".join(part for part in combined_parts if part).strip()
         if search_ready:
-            search_ready(input_mode, search_report, visual_report, retrieval_plan)
+            search_ready(
+                input_mode,
+                search_report,
+                visual_report,
+                retrieval_plan,
+                controller_report,
+            )
 
         head_list = ", ".join(head_names)
         self._emit_progress(progress, "heads", f"Running task heads: {head_list}.")
@@ -642,6 +829,7 @@ class MemeResearchWorkflow:
             combined_context=combined_context,
             visual_report=visual_report,
             retrieval_plan=retrieval_plan,
+            controller_report=controller_report,
             memory_report=memory_report,
             input_mode=input_mode,
         )

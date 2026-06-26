@@ -37,12 +37,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--search",
         action="store_true",
-        help="Allow MemeAgent to decide whether web/news retrieval is needed.",
+        help="Compatibility flag; retrieval is always enabled.",
     )
     parser.add_argument(
         "--force-search",
         action="store_true",
-        help="Force web/news retrieval and skip the LLM retrieval-needed decision.",
+        help="Compatibility flag; retrieval is always forced.",
     )
     parser.add_argument(
         "--show-search",
@@ -59,6 +59,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=3,
         help="Maximum retrieval rounds when --iterative-search is enabled.",
+    )
+    parser.add_argument(
+        "--controller-max-rounds",
+        type=int,
+        default=3,
+        help="Maximum controller-planned analysis rounds before final output.",
+    )
+    parser.add_argument(
+        "--controller-confidence-threshold",
+        type=float,
+        default=0.8,
+        help="Controller confidence threshold for final output.",
     )
     parser.add_argument(
         "--search-provider",
@@ -180,6 +192,12 @@ def parse_args() -> argparse.Namespace:
         help="Render streamed analysis as a live Markdown panel. Plain streaming is steadier.",
     )
     parser.add_argument(
+        "--trace-mode",
+        choices=["live", "off"],
+        default="live",
+        help="Show a live workflow trace while running, then clear it before final output.",
+    )
+    parser.add_argument(
         "--task",
         action="append",
         default=[],
@@ -201,7 +219,7 @@ def main() -> None:
     project_root = Path(__file__).resolve().parent
     load_project_env(project_root)
     args = parse_args()
-    search_requested = args.search or args.force_search
+    search_requested = True
 
     if args.list_tasks:
         print("Available MemeAgent task heads:")
@@ -311,7 +329,11 @@ def main() -> None:
         memory_store=memory_store,
         memory_recall_limit=config.memory_recall_limit,
     )
-    ui = MemeAgentCLI(enabled=not args.plain, stream_markdown=args.stream_markdown)
+    ui = MemeAgentCLI(
+        enabled=not args.plain,
+        stream_markdown=args.stream_markdown,
+        trace_mode=args.trace_mode,
+    )
 
     try:
         ui.print_start(
@@ -343,6 +365,7 @@ def main() -> None:
             search_report: str,
             visual_report: str,
             retrieval_plan: str,
+            controller_report: str,
         ) -> None:
             nonlocal search_shown
             if not (search_requested and args.show_search):
@@ -355,6 +378,7 @@ def main() -> None:
                 search_report=search_report,
                 visual_report=visual_report,
                 retrieval_plan=retrieval_plan,
+                controller_report=controller_report,
                 show_search=True,
             )
 
@@ -375,6 +399,8 @@ def main() -> None:
                 ),
                 iterative_search=args.iterative_search,
                 search_max_rounds=args.search_max_rounds,
+                controller_max_rounds=args.controller_max_rounds,
+                controller_confidence_threshold=args.controller_confidence_threshold,
             )
             ui.stop_activity()
             ui.print_result(
@@ -383,6 +409,7 @@ def main() -> None:
                 search_report=result.search_report,
                 visual_report=result.visual_report,
                 retrieval_plan=result.retrieval_plan,
+                controller_report=result.controller_report,
                 show_search=search_requested and args.show_search and not search_shown,
                 analysis_title="Task Heads",
             )
@@ -401,6 +428,8 @@ def main() -> None:
             search_ready=handle_search_ready if search_requested and args.show_search else None,
             iterative_search=args.iterative_search,
             search_max_rounds=args.search_max_rounds,
+            controller_max_rounds=args.controller_max_rounds,
+            controller_confidence_threshold=args.controller_confidence_threshold,
         )
         if args.stream:
             ui.stop_stream()
@@ -411,6 +440,7 @@ def main() -> None:
                     search_report=result.search_report,
                     visual_report=result.visual_report,
                     retrieval_plan=result.retrieval_plan,
+                    controller_report=result.controller_report,
                     show_search=True,
                 )
         else:
@@ -421,6 +451,7 @@ def main() -> None:
                 search_report=result.search_report,
                 visual_report=result.visual_report,
                 retrieval_plan=result.retrieval_plan,
+                controller_report=result.controller_report,
                 show_search=search_requested and args.show_search and not search_shown,
             )
     except KeyboardInterrupt:

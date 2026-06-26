@@ -44,6 +44,7 @@ _TAVILY_SEARCH_API = "https://api.tavily.com/search"
 _ZHIHU_SEARCH_API = "https://developer.zhihu.com/api/v1/content/zhihu_search"
 _ANSPIRE_SEARCH_API = "https://plugin.anspire.cn/api/ntsearch/search"
 _SEARCH_PARALLEL_WORKERS = 8
+_SEARCH_PROVIDER_QUERY_WORKERS = 4
 _DEFAULT_CONTEXT_SITES = (
     "reddit.com",
     "x.com",
@@ -351,6 +352,8 @@ class WebSearchAgent:
         self._cache_hits = 0
         self._cache_misses = 0
         self._cache_stores = 0
+        self._last_web_errors: list[str] = []
+        self._last_news_errors: list[str] = []
 
     def _reset_cache_stats(self) -> None:
         with self._cache_stats_lock:
@@ -1212,6 +1215,16 @@ class WebSearchAgent:
         self,
         query_input: list[str] | tuple[list[str], set[str]],
     ) -> list[dict[str, Any]]:
+        results, errors = self._search_text_queries_with_errors(query_input)
+        self._last_web_errors = errors
+        if not results and errors:
+            raise ValueError("; ".join(errors))
+        return results
+
+    def _search_text_queries_with_errors(
+        self,
+        query_input: list[str] | tuple[list[str], set[str]],
+    ) -> tuple[list[dict[str, Any]], list[str]]:
         if isinstance(query_input, tuple):
             queries, relevance_terms = query_input
         else:
@@ -1225,14 +1238,22 @@ class WebSearchAgent:
             max_results=self.config.search_max_results * len(self._search_providers()),
             kind="web",
         )
-        if not results and errors:
-            raise ValueError("; ".join(errors))
-        return results
+        return results, errors
 
     def _search_news_queries(
         self,
         query_input: list[str] | tuple[list[str], str],
     ) -> list[dict[str, Any]]:
+        results, errors = self._search_news_queries_with_errors(query_input)
+        self._last_news_errors = errors
+        if not results and errors:
+            raise ValueError("; ".join(errors))
+        return results
+
+    def _search_news_queries_with_errors(
+        self,
+        query_input: list[str] | tuple[list[str], str],
+    ) -> tuple[list[dict[str, Any]], list[str]]:
         context = ""
         if isinstance(query_input, tuple):
             queries, context = query_input
@@ -1248,9 +1269,7 @@ class WebSearchAgent:
             max_results=self.config.news_max_results,
             kind="news",
         )
-        if not results and errors:
-            raise ValueError("; ".join(errors))
-        return results
+        return results, errors
 
     def _search_queries_in_parallel(
         self,
@@ -1261,28 +1280,27 @@ class WebSearchAgent:
         kind: str,
     ) -> tuple[list[dict[str, Any]], list[str]]:
         providers = self._search_providers()
-        tasks: list[tuple[int, str, str]] = [
-            (query_index * len(providers) + provider_index, provider, query)
-            for query_index, query in enumerate(queries)
-            for provider_index, provider in enumerate(providers)
-        ]
-        if not tasks:
+        if not queries or not providers:
             return [], []
 
         results: list[dict[str, Any]] = []
         errors: list[str] = []
         deadline = time.monotonic() + self.config.search_timeout
 
-        def run_task(provider: str, query: str) -> list[dict[str, Any]]:
-            return search_fn(provider, query)
-
         executor = ThreadPoolExecutor(
-            max_workers=min(_SEARCH_PARALLEL_WORKERS, len(tasks)),
+            max_workers=min(_SEARCH_PARALLEL_WORKERS, len(providers)),
             thread_name_prefix=f"memeagent-{kind}-search",
         )
         futures = {
-            executor.submit(run_task, provider, query): (order, provider, query)
-            for order, provider, query in tasks
+            executor.submit(
+                self._search_provider_queries_in_parallel,
+                provider,
+                queries,
+                search_fn,
+                kind,
+                self.config.search_timeout,
+            ): provider
+            for provider in providers
         }
         pending = set(futures)
 
@@ -1301,26 +1319,29 @@ class WebSearchAgent:
                     break
 
                 for future in done:
-                    order, provider, query = futures[future]
+                    provider = futures[future]
                     try:
-                        task_results = future.result()
+                        provider_results, provider_errors = future.result()
                     except Exception as exc:
                         logger.debug(
-                            "%s search provider %s failed for query=%s: %s",
+                            "%s search provider %s failed: %s",
                             kind,
                             provider,
-                            query,
                             exc,
                         )
-                        errors.append(f"{query} / {provider}: {exc}")
+                        errors.append(f"{provider}: {exc}")
                         continue
 
-                    for item in task_results:
-                        results.append(item)
+                    results.extend(provider_results)
+                    errors.extend(provider_errors)
         finally:
             if pending:
+                pending_providers = ", ".join(
+                    futures[future] for future in pending
+                )
                 errors.append(
-                    f"{kind.capitalize()} search timed out with {len(pending)} task(s) unfinished"
+                    f"{kind.capitalize()} search timed out for provider(s): "
+                    f"{pending_providers}"
                 )
                 for future in pending:
                     future.cancel()
@@ -1331,6 +1352,67 @@ class WebSearchAgent:
             max_results=max_results,
             relevance_terms=relevance_terms,
         ), errors
+
+    def _search_provider_queries_in_parallel(
+        self,
+        provider: str,
+        queries: list[str],
+        search_fn,
+        kind: str,
+        timeout: float,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        results: list[dict[str, Any]] = []
+        errors: list[str] = []
+        deadline = time.monotonic() + timeout
+
+        executor = ThreadPoolExecutor(
+            max_workers=min(_SEARCH_PROVIDER_QUERY_WORKERS, len(queries)),
+            thread_name_prefix=f"memeagent-{kind}-{provider}",
+        )
+        futures = {
+            executor.submit(search_fn, provider, query): query
+            for query in queries
+        }
+        pending = set(futures)
+
+        try:
+            while pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+
+                done, pending = wait(
+                    pending,
+                    timeout=remaining,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done:
+                    break
+
+                for future in done:
+                    query = futures[future]
+                    try:
+                        results.extend(future.result())
+                    except Exception as exc:
+                        logger.debug(
+                            "%s search provider %s failed for query=%s: %s",
+                            kind,
+                            provider,
+                            query,
+                            exc,
+                        )
+                        errors.append(f"{query} / {provider}: {exc}")
+        finally:
+            if pending:
+                errors.append(
+                    f"{provider}: {kind} search timed out with "
+                    f"{len(pending)} query task(s) unfinished"
+                )
+                for future in pending:
+                    future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+
+        return results, errors
 
     def _dedupe_results(
         self,
@@ -1468,21 +1550,23 @@ class WebSearchAgent:
             self._format_query_plan(query_plan),
         ]
 
-        text_results, text_error = self._run_with_timeout(
-            self._search_text_queries,
-            (queries, relevance_terms),
-            "Web search",
-        )
-        if text_error:
-            sections.append(text_error)
+        try:
+            self._last_web_errors = []
+            text_results = self._search_text_queries((queries, relevance_terms))
+        except Exception as exc:
+            text_results = []
+            sections.append(f"Web search failed: {exc}")
+        else:
+            sections.extend(self._last_web_errors)
 
-        news_results, news_error = self._run_with_timeout(
-            self._search_news_queries,
-            (queries, context),
-            "News search",
-        )
-        if news_error:
-            sections.append(news_error)
+        try:
+            self._last_news_errors = []
+            news_results = self._search_news_queries((queries, context))
+        except Exception as exc:
+            news_results = []
+            sections.append(f"News search failed: {exc}")
+        else:
+            sections.extend(self._last_news_errors)
 
         sections.insert(1, self._format_cache_stats())
 

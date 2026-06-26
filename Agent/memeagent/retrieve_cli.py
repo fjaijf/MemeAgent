@@ -16,6 +16,7 @@ from .search_agent import (
     SearchAgentConfig,
     WebSearchAgent,
     _format_context_results,
+    _query_terms,
 )
 
 
@@ -207,23 +208,31 @@ def run_retrieval(
 
     if mode in {"web", "both"}:
         relevance_terms = _result_relevance_terms(agent, topic, context, queries)
-        web_results, web_error = agent._run_with_timeout(
-            agent._search_text_queries,
-            (queries, relevance_terms),
-            "Web search",
-        )
-        if web_error:
-            errors.append(web_error)
+        try:
+            web_results, web_errors = agent._search_text_queries_with_errors(
+                (queries, relevance_terms)
+            )
+        except Exception as exc:
+            errors.append(f"Web search failed: {exc}")
+        else:
+            errors.extend(web_errors)
 
     if mode in {"news", "both"}:
         news_runner = news_agent or agent
-        news_results, news_error = news_runner._run_with_timeout(
-            lambda payload: _search_news_direct(*payload),
-            (news_runner, news_queries),
-            "News search",
-        )
-        if news_error:
-            errors.append(news_error)
+        try:
+            news_results, news_errors = news_runner._search_queries_in_parallel(
+                queries=news_queries,
+                search_fn=news_runner._search_news_provider,
+                relevance_terms=set().union(
+                    *(_query_terms(query) for query in news_queries)
+                ),
+                max_results=news_runner.config.news_max_results,
+                kind="news",
+            )
+        except Exception as exc:
+            errors.append(f"News search failed: {exc}")
+        else:
+            errors.extend(news_errors)
 
     context_results = (
         fetch_contexts_for_results(

@@ -459,16 +459,12 @@ def make_workflow(config: MemeAgentConfig, project_root: Path, disable_memory: b
 def predict_workflow(
     workflow: MemeResearchWorkflow,
     item: EvalItem,
-    use_search: bool,
-    force_search: bool,
 ) -> Prediction:
     result = workflow.run_heads(
         topic=item.sample_id,
         context=item.context,
         image_paths=[item.image_path],
         task_heads=["harmfulness"],
-        use_search=use_search,
-        force_search=force_search,
         progress=None,
     )
     return _prediction_from_text(result.formatted_output)
@@ -596,8 +592,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--resume", action="store_true", help="Skip ids already present in --output.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite output and summary files.")
-    parser.add_argument("--search", action="store_true", help="Enable retrieval in workflow mode.")
-    parser.add_argument("--force-search", action="store_true", help="Force retrieval in workflow mode.")
+    parser.add_argument(
+        "--search",
+        action="store_true",
+        help="Compatibility flag; retrieval is always enabled in workflow mode.",
+    )
+    parser.add_argument(
+        "--force-search",
+        action="store_true",
+        help="Compatibility flag; retrieval is always forced in workflow mode.",
+    )
     parser.add_argument("--disable-memory", action="store_true", help="Do not read/write local memory.")
     parser.add_argument(
         "--include-unlabeled",
@@ -693,8 +697,6 @@ def main() -> int:
                     prediction = predict_workflow(
                         workflow,
                         item,
-                        use_search=args.search or args.force_search,
-                        force_search=args.force_search,
                     )
                 else:
                     prediction = predict_direct(_thread_direct_agent(config), item)

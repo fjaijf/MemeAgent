@@ -6,6 +6,7 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from .agent import _normalize_content
+from .rubrics import MEME_ANALYSIS_RUBRIC
 
 
 @dataclass(frozen=True)
@@ -34,7 +35,7 @@ Analyze only harmfulness and safety-relevant risk. Do not produce a general meme
 
 Return Chinese output with exactly these sections:
 1. Label
-   - harmfulness_label: one of harmful, potentially_harmful, unclear, not_harmful
+   - harmfulness_labels: any of Discrimination, Offensive, Violence, Vulgar, Antagonism, Not harmful, Unclear
    - severity: one of high, medium, low, none, unknown
    - confidence: high, medium, low
 2. Target and harm type
@@ -47,6 +48,7 @@ Return Chinese output with exactly these sections:
 4. Rationale
 5. Uncertainty and missing evidence
 
+Apply the project harmfulness rubric strictly. Any reference to sensitive events is Offensive.
 Use source tags strictly: [Image], [User Context], [W#], [N#], [Inference].
 If iterative retrieval is used, cite round-specific labels exactly as shown, such as [R2-W1] or [R2-N1].
 Do not invent source IDs.
@@ -62,7 +64,8 @@ Analyze only emotion and sentiment. Do not produce a general meme report.
 
 Return Chinese output with exactly these sections:
 1. Label
-   - sentiment_polarity: positive, negative, mixed, neutral, unclear
+   - primary_sentiment: one of Joy, Sadness, Anger, Disgust, Fear, Surprise, unclear
+   - secondary_sentiments:
    - intensity: high, medium, low, none, unknown
    - confidence: high, medium, low
 2. Emotion profile
@@ -78,6 +81,7 @@ Return Chinese output with exactly these sections:
    - retrieved_evidence:
 5. Uncertainty and missing evidence
 
+Use the project sentiment rubric, including multimodal mismatch rules.
 Use source tags strictly: [Image], [User Context], [W#], [N#], [Inference].
 If iterative retrieval is used, cite round-specific labels exactly as shown, such as [R2-W1] or [R2-N1].
 Do not invent source IDs.
@@ -93,7 +97,7 @@ Analyze only the likely communicative intent. Do not produce a general meme repo
 
 Return Chinese output with exactly these sections:
 1. Label
-   - primary_intent: entertainment, satire, criticism, ridicule, persuasion, mobilization, misinformation, identity_signal, harassment, unclear
+   - primary_intent: one of Teleological, Normative, Dramaturgical, Communicative, mixed, unclear
    - secondary_intents:
    - confidence: high, medium, low
 2. Actor and audience hypothesis
@@ -106,6 +110,7 @@ Return Chinese output with exactly these sections:
 4. Alternative interpretations
 5. Uncertainty and missing evidence
 
+Use the project Habermas-based intent rubric.
 Use source tags strictly: [Image], [User Context], [W#], [N#], [Inference].
 If iterative retrieval is used, cite round-specific labels exactly as shown, such as [R2-W1] or [R2-N1].
 Do not invent source IDs.
@@ -125,19 +130,28 @@ Return Chinese output with exactly these sections:
    - likely_template:
    - known_reference_or_origin:
    - confidence: high, medium, low
-2. Mutation and adaptation
+2. Mutation and phylogenetic tracking
    - visual_mutations:
    - textual_mutations:
    - semantic_shift:
-3. Circulation context
+3. Core kernel fidelity
+   - invariant_core:
+   - variable_elements:
+   - metaphor_or_structural_irony:
+4. Lifecycle and diffusion
+   - lifecycle_phase: incubation, outbreak, saturation, decay/obsolescence, unclear
    - likely_platform_or_community:
    - cross_platform_potential:
-4. Evidence
+5. Intertextual splicing
+   - referenced_assets:
+   - splicing_index: low, medium, high, unclear
+6. Evidence
    - image_evidence:
    - user_context_evidence:
    - retrieved_evidence:
-5. Uncertainty and next retrieval targets
+7. Uncertainty and next retrieval targets
 
+Use the project evolution rubric.
 Use source tags strictly: [Image], [User Context], [W#], [N#], [Inference].
 If iterative retrieval is used, cite round-specific labels exactly as shown, such as [R2-W1] or [R2-N1].
 Do not invent source IDs.
@@ -153,8 +167,10 @@ Analyze only audience interpretation and likely reception. Do not produce a gene
 
 Return Chinese output with exactly these sections:
 1. Likely audiences
+   - primary_audience_type: Gemeinschaft-oriented, Gesellschaft-oriented, mixed, unclear
    - primary_audience:
    - secondary_audiences:
+   - knowledge_threshold: high, medium, low
    - confidence: high, medium, low
 2. Reception prediction
    - supportive_reading:
@@ -167,6 +183,7 @@ Return Chinese output with exactly these sections:
    - retrieved_evidence:
 5. Uncertainty and missing evidence
 
+Use the project Tonnies-based audience rubric.
 Use source tags strictly: [Image], [User Context], [W#], [N#], [Inference].
 If iterative retrieval is used, cite round-specific labels exactly as shown, such as [R2-W1] or [R2-N1].
 Do not invent source IDs.
@@ -223,6 +240,9 @@ Input mode: {input_mode}
 
 Shared evidence pack:
 {evidence_context or "None"}
+
+Project rubric:
+{MEME_ANALYSIS_RUBRIC}
 
 Task instruction:
 {head.prompt}
