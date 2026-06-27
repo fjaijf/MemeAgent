@@ -157,6 +157,18 @@ python main.py --topic "PEPE" --trace-mode off
 python main.py --topic "PEPE" --search --show-search --plain
 ```
 
+MemeAgent also records a persistent workflow trajectory by default at
+`.memeagent_cache/trajectory.sqlite3`. This cache stores the input payload,
+memory report, visual report, retrieval plan, search report, controller report,
+combined context, final output, and failed-run error state. It records observable
+workflow artifacts and model outputs, not hidden chain-of-thought text.
+
+```bash
+python main.py --topic "PEPE" --no-trajectory-cache
+MEMEAGENT_TRAJECTORY_CACHE_ENABLED=false
+MEMEAGENT_TRAJECTORY_CACHE_DIR=.memeagent_cache
+```
+
 To stream the final analysis as it is generated, add:
 
 ```bash

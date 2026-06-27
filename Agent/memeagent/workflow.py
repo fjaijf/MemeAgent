@@ -13,6 +13,7 @@ from .heads import (
 )
 from .memory import MemeMemoryStore
 from .search_agent import WebSearchAgent
+from .trajectory import MemeTrajectoryCache
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,7 @@ class WorkflowResult:
     controller_report: str = ""
     memory_report: str = ""
     input_mode: str = "text_only"
+    trajectory_run_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -38,6 +40,7 @@ class MultiHeadWorkflowResult:
     controller_report: str = ""
     memory_report: str = ""
     input_mode: str = "text_only"
+    trajectory_run_id: str = ""
 
 
 class MemeResearchWorkflow:
@@ -50,12 +53,14 @@ class MemeResearchWorkflow:
         controller_agent: MemeAgent | None = None,
         memory_store: MemeMemoryStore | None = None,
         memory_recall_limit: int = 3,
+        trajectory_cache: MemeTrajectoryCache | None = None,
     ) -> None:
         self.meme_agent = meme_agent
         self.controller_agent = controller_agent or meme_agent
         self.search_agent = search_agent
         self.memory_store = memory_store
         self.memory_recall_limit = memory_recall_limit
+        self.trajectory_cache = trajectory_cache
 
     def _emit_progress(
         self,
@@ -65,6 +70,79 @@ class MemeResearchWorkflow:
     ) -> None:
         if progress:
             progress(stage, message)
+
+    def _start_trajectory(
+        self,
+        *,
+        workflow_kind: str,
+        topic: str,
+        context: str,
+        image_paths: list[str],
+        image_urls: list[str],
+        input_mode: str,
+        options: dict[str, object],
+    ) -> str:
+        if not self.trajectory_cache:
+            return ""
+        try:
+            return self.trajectory_cache.start_run(
+                workflow_kind=workflow_kind,
+                topic=topic,
+                context=context,
+                image_paths=image_paths,
+                image_urls=image_urls,
+                input_mode=input_mode,
+                options=options,
+            )
+        except Exception:
+            return ""
+
+    def _record_trajectory(
+        self,
+        run_id: str,
+        *,
+        stage: str,
+        name: str,
+        payload: dict[str, object] | None = None,
+    ) -> None:
+        if not run_id or not self.trajectory_cache:
+            return
+        try:
+            self.trajectory_cache.record_event(
+                run_id,
+                stage=stage,
+                name=name,
+                payload=payload or {},
+            )
+        except Exception:
+            return
+
+    def _finish_trajectory(
+        self,
+        run_id: str,
+        *,
+        output: dict[str, object],
+    ) -> None:
+        if not run_id or not self.trajectory_cache:
+            return
+        try:
+            self.trajectory_cache.finish_run(run_id, output=output)
+        except Exception:
+            return
+
+    def _fail_trajectory(
+        self,
+        run_id: str,
+        *,
+        error: Exception,
+        output: dict[str, object],
+    ) -> None:
+        if not run_id or not self.trajectory_cache:
+            return
+        try:
+            self.trajectory_cache.fail_run(run_id, error=str(error), output=output)
+        except Exception:
+            return
 
     def _detect_input_mode(
         self,
@@ -485,183 +563,300 @@ class MemeResearchWorkflow:
         retrieval_plan = ""
         controller_report = ""
         memory_report = ""
-        combined_parts: list[str] = []
-        input_mode = self._detect_input_mode(topic, context, image_paths, image_urls)
-        has_images = input_mode in {"image_only", "text_and_image"}
-        self._emit_progress(progress, "input", f"Input mode detected: {input_mode}.")
+        combined_context = ""
+        input_mode = ""
+        trajectory_run_id = ""
 
-        if context.strip():
-            combined_parts.append(context.strip())
-
-        if self.memory_store:
-            self._emit_progress(progress, "memory", "Checking local MemeAgent memory.")
-            memory_records = self.memory_store.recall(
+        try:
+            combined_parts: list[str] = []
+            input_mode = self._detect_input_mode(topic, context, image_paths, image_urls)
+            has_images = input_mode in {"image_only", "text_and_image"}
+            trajectory_run_id = self._start_trajectory(
+                workflow_kind="analysis",
                 topic=topic,
                 image_paths=image_paths,
                 image_urls=image_urls,
-                limit=self.memory_recall_limit,
+                context=context,
+                input_mode=input_mode,
+                options={
+                    "use_search": use_search,
+                    "force_search": force_search,
+                    "stream_analysis": stream_analysis,
+                    "iterative_search": iterative_search,
+                    "search_max_rounds": search_max_rounds,
+                    "controller_max_rounds": controller_max_rounds,
+                    "controller_confidence_threshold": controller_confidence_threshold,
+                },
             )
-            memory_card = self.memory_store.recall_card(topic)
-            memory_report = self.memory_store.format_records(
-                memory_records,
-                card=memory_card,
+            self._record_trajectory(
+                trajectory_run_id,
+                stage="input",
+                name="input_detected",
+                payload={
+                    "input_mode": input_mode,
+                    "topic": topic,
+                    "context": context,
+                    "image_paths": image_paths,
+                    "image_urls": image_urls,
+                },
             )
-            if memory_report:
-                combined_parts.append(memory_report)
-                self._emit_progress(progress, "memory", "Local memory attached.")
-            else:
-                self._emit_progress(progress, "memory", "No local memory found.")
+            self._emit_progress(progress, "input", f"Input mode detected: {input_mode}.")
 
-        if has_images:
-            self._emit_progress(
-                progress,
-                "vision",
-                "Describing image content for retrieval and analysis.",
-            )
-            try:
-                visual_report = self.meme_agent.describe_images_for_search(
+            if context.strip():
+                combined_parts.append(context.strip())
+
+            if self.memory_store:
+                self._emit_progress(progress, "memory", "Checking local MemeAgent memory.")
+                memory_records = self.memory_store.recall(
                     topic=topic,
-                    context=context,
                     image_paths=image_paths,
                     image_urls=image_urls,
+                    limit=self.memory_recall_limit,
                 )
-            except Exception as exc:
-                raise RuntimeError("Image pre-analysis LLM call failed.") from exc
-            self._emit_progress(progress, "vision", "Image-derived search context ready.")
+                memory_card = self.memory_store.recall_card(topic)
+                memory_report = self.memory_store.format_records(
+                    memory_records,
+                    card=memory_card,
+                )
+                self._record_trajectory(
+                    trajectory_run_id,
+                    stage="memory",
+                    name="memory_recalled",
+                    payload={
+                        "record_count": len(memory_records),
+                        "has_topic_card": memory_card is not None,
+                        "memory_report": memory_report,
+                    },
+                )
+                if memory_report:
+                    combined_parts.append(memory_report)
+                    self._emit_progress(progress, "memory", "Local memory attached.")
+                else:
+                    self._emit_progress(progress, "memory", "No local memory found.")
 
-        retrieval_plan, plan_label = self._prepare_retrieval_plan(
-            topic=topic,
-            context=context,
-            visual_report=visual_report,
-            input_mode=input_mode,
-            progress=progress,
-        )
-        if retrieval_plan:
-            combined_parts.append(f"{plan_label}:\n" + retrieval_plan)
-        self._emit_progress(progress, "planning", "External retrieval forced.")
-        search_report = self._run_search_with_reflection(
-            topic=topic,
-            context=context,
-            visual_report=visual_report,
-            retrieval_plan=retrieval_plan,
-            input_mode=input_mode,
-            iterative_search=iterative_search,
-            search_max_rounds=search_max_rounds,
-            progress=progress,
-        )
-
-        controller_report, visual_report, search_report = self._run_controller_analysis_loop(
-            topic=topic,
-            context=context,
-            visual_report=visual_report,
-            search_report=search_report,
-            input_mode=input_mode,
-            image_paths=image_paths,
-            image_urls=image_urls,
-            max_rounds=controller_max_rounds,
-            confidence_threshold=controller_confidence_threshold,
-            progress=progress,
-        )
-        if controller_report:
-            combined_parts.append(
-                "Controller planning and confidence report. Use these focus notes, "
-                "but still ground the final answer in source labels:\n"
-                + controller_report
-            )
-        if visual_report:
-            combined_parts.append(
-                "Cumulative image analysis after controller-directed passes:\n"
-                + visual_report
-            )
-        if search_report:
-            combined_parts.append(
-                "Cumulative internet search findings after controller-directed passes. "
-                "Cite source labels exactly as shown:\n"
-                + search_report
-            )
-
-        combined_context = "\n\n".join(part for part in combined_parts if part).strip()
-        if search_ready:
-            search_ready(
-                input_mode,
-                search_report,
-                visual_report,
-                retrieval_plan,
-                controller_report,
-            )
-        self._emit_progress(progress, "analysis", "Running final meme analysis.")
-        try:
-            if stream_analysis:
-                chunks: list[str] = []
+            if has_images:
+                self._emit_progress(
+                    progress,
+                    "vision",
+                    "Describing image content for retrieval and analysis.",
+                )
                 try:
-                    for chunk in self.meme_agent.stream(
+                    visual_report = self.meme_agent.describe_images_for_search(
                         topic=topic,
-                        context=combined_context,
+                        context=context,
                         image_paths=image_paths,
                         image_urls=image_urls,
-                    ):
-                        chunks.append(chunk)
-                        if analysis_delta:
-                            analysis_delta(chunk)
-                except Exception as stream_exc:
-                    if not chunks:
-                        analysis = self.meme_agent.run(
+                    )
+                except Exception as exc:
+                    raise RuntimeError("Image pre-analysis LLM call failed.") from exc
+                self._record_trajectory(
+                    trajectory_run_id,
+                    stage="vision",
+                    name="initial_visual_report",
+                    payload={"visual_report": visual_report},
+                )
+                self._emit_progress(progress, "vision", "Image-derived search context ready.")
+
+            retrieval_plan, plan_label = self._prepare_retrieval_plan(
+                topic=topic,
+                context=context,
+                visual_report=visual_report,
+                input_mode=input_mode,
+                progress=progress,
+            )
+            self._record_trajectory(
+                trajectory_run_id,
+                stage="planning",
+                name="retrieval_plan_ready",
+                payload={"plan_label": plan_label, "retrieval_plan": retrieval_plan},
+            )
+            if retrieval_plan:
+                combined_parts.append(f"{plan_label}:\n" + retrieval_plan)
+            self._emit_progress(progress, "planning", "External retrieval forced.")
+            search_report = self._run_search_with_reflection(
+                topic=topic,
+                context=context,
+                visual_report=visual_report,
+                retrieval_plan=retrieval_plan,
+                input_mode=input_mode,
+                iterative_search=iterative_search,
+                search_max_rounds=search_max_rounds,
+                progress=progress,
+            )
+            self._record_trajectory(
+                trajectory_run_id,
+                stage="search",
+                name="search_report_ready",
+                payload={"search_report": search_report},
+            )
+
+            controller_report, visual_report, search_report = self._run_controller_analysis_loop(
+                topic=topic,
+                context=context,
+                visual_report=visual_report,
+                search_report=search_report,
+                input_mode=input_mode,
+                image_paths=image_paths,
+                image_urls=image_urls,
+                max_rounds=controller_max_rounds,
+                confidence_threshold=controller_confidence_threshold,
+                progress=progress,
+            )
+            self._record_trajectory(
+                trajectory_run_id,
+                stage="controller",
+                name="controller_loop_ready",
+                payload={
+                    "controller_report": controller_report,
+                    "visual_report": visual_report,
+                    "search_report": search_report,
+                },
+            )
+            if controller_report:
+                combined_parts.append(
+                    "Controller planning and confidence report. Use these focus notes, "
+                    "but still ground the final answer in source labels:\n"
+                    + controller_report
+                )
+            if visual_report:
+                combined_parts.append(
+                    "Cumulative image analysis after controller-directed passes:\n"
+                    + visual_report
+                )
+            if search_report:
+                combined_parts.append(
+                    "Cumulative internet search findings after controller-directed passes. "
+                    "Cite source labels exactly as shown:\n"
+                    + search_report
+                )
+
+            combined_context = "\n\n".join(part for part in combined_parts if part).strip()
+            self._record_trajectory(
+                trajectory_run_id,
+                stage="context",
+                name="combined_context_ready",
+                payload={"combined_context": combined_context},
+            )
+            if search_ready:
+                search_ready(
+                    input_mode,
+                    search_report,
+                    visual_report,
+                    retrieval_plan,
+                    controller_report,
+                )
+            self._emit_progress(progress, "analysis", "Running final meme analysis.")
+            try:
+                if stream_analysis:
+                    chunks: list[str] = []
+                    try:
+                        for chunk in self.meme_agent.stream(
                             topic=topic,
                             context=combined_context,
                             image_paths=image_paths,
                             image_urls=image_urls,
+                        ):
+                            chunks.append(chunk)
+                            if analysis_delta:
+                                analysis_delta(chunk)
+                    except Exception as stream_exc:
+                        if not chunks:
+                            analysis = self.meme_agent.run(
+                                topic=topic,
+                                context=combined_context,
+                                image_paths=image_paths,
+                                image_urls=image_urls,
+                            )
+                        else:
+                            warning = (
+                                "\n\n[Stream Warning] The streaming connection closed "
+                                "before the final chunk arrived. The analysis above is "
+                                "the partial output received before interruption."
+                            )
+                            chunks.append(warning)
+                            if analysis_delta:
+                                analysis_delta(warning)
+                            analysis = "".join(chunks)
+                        logger_message = getattr(stream_exc, "args", [""])[0]
+                        self._emit_progress(
+                            progress,
+                            "analysis",
+                            f"Streaming ended early: {logger_message}",
                         )
                     else:
-                        warning = (
-                            "\n\n[Stream Warning] The streaming connection closed "
-                            "before the final chunk arrived. The analysis above is "
-                            "the partial output received before interruption."
-                        )
-                        chunks.append(warning)
-                        if analysis_delta:
-                            analysis_delta(warning)
                         analysis = "".join(chunks)
-                    logger_message = getattr(stream_exc, "args", [""])[0]
-                    self._emit_progress(
-                        progress,
-                        "analysis",
-                        f"Streaming ended early: {logger_message}",
-                    )
                 else:
-                    analysis = "".join(chunks)
-            else:
-                analysis = self.meme_agent.run(
+                    analysis = self.meme_agent.run(
+                        topic=topic,
+                        context=combined_context,
+                        image_paths=image_paths,
+                        image_urls=image_urls,
+                    )
+            except Exception as exc:
+                raise RuntimeError("Final analysis LLM call failed.") from exc
+            self._record_trajectory(
+                trajectory_run_id,
+                stage="analysis",
+                name="final_analysis_ready",
+                payload={"analysis": analysis, "streamed": stream_analysis},
+            )
+
+            if self.memory_store:
+                self._emit_progress(progress, "memory", "Saving analysis to local memory.")
+                self.memory_store.remember(
                     topic=topic,
-                    context=combined_context,
                     image_paths=image_paths,
                     image_urls=image_urls,
+                    input_mode=input_mode,
+                    analysis=analysis,
+                    visual_report=visual_report,
+                    retrieval_plan=retrieval_plan,
+                    search_report=search_report,
                 )
-        except Exception as exc:
-            raise RuntimeError("Final analysis LLM call failed.") from exc
-
-        if self.memory_store:
-            self._emit_progress(progress, "memory", "Saving analysis to local memory.")
-            self.memory_store.remember(
-                topic=topic,
-                image_paths=image_paths,
-                image_urls=image_urls,
-                input_mode=input_mode,
+                self._record_trajectory(
+                    trajectory_run_id,
+                    stage="memory",
+                    name="analysis_saved",
+                    payload={"saved": True},
+                )
+            output_payload = {
+                "input_mode": input_mode,
+                "analysis": analysis,
+                "combined_context": combined_context,
+                "memory_report": memory_report,
+                "visual_report": visual_report,
+                "retrieval_plan": retrieval_plan,
+                "search_report": search_report,
+                "controller_report": controller_report,
+            }
+            self._finish_trajectory(trajectory_run_id, output=output_payload)
+            self._emit_progress(progress, "analysis", "Final analysis ready.")
+            return WorkflowResult(
+                search_report=search_report,
                 analysis=analysis,
+                combined_context=combined_context,
                 visual_report=visual_report,
                 retrieval_plan=retrieval_plan,
-                search_report=search_report,
+                controller_report=controller_report,
+                memory_report=memory_report,
+                input_mode=input_mode,
+                trajectory_run_id=trajectory_run_id,
             )
-        self._emit_progress(progress, "analysis", "Final analysis ready.")
-        return WorkflowResult(
-            search_report=search_report,
-            analysis=analysis,
-            combined_context=combined_context,
-            visual_report=visual_report,
-            retrieval_plan=retrieval_plan,
-            controller_report=controller_report,
-            memory_report=memory_report,
-            input_mode=input_mode,
-        )
+        except Exception as exc:
+            self._fail_trajectory(
+                trajectory_run_id,
+                error=exc,
+                output={
+                    "input_mode": input_mode,
+                    "combined_context": combined_context,
+                    "memory_report": memory_report,
+                    "visual_report": visual_report,
+                    "retrieval_plan": retrieval_plan,
+                    "search_report": search_report,
+                    "controller_report": controller_report,
+                },
+            )
+            raise
 
     def run_heads(
         self,
@@ -687,149 +882,280 @@ class MemeResearchWorkflow:
         retrieval_plan = ""
         controller_report = ""
         memory_report = ""
-        combined_parts: list[str] = []
-        input_mode = self._detect_input_mode(topic, context, image_paths, image_urls)
-        has_images = input_mode in {"image_only", "text_and_image"}
-        self._emit_progress(progress, "input", f"Input mode detected: {input_mode}.")
+        combined_context = ""
+        formatted_output = ""
+        head_results: list[HeadResult] = []
+        input_mode = ""
+        trajectory_run_id = ""
 
-        if context.strip():
-            combined_parts.append("[User Context]\n" + context.strip())
-
-        if self.memory_store:
-            self._emit_progress(progress, "memory", "Checking local MemeAgent memory.")
-            memory_records = self.memory_store.recall(
+        try:
+            combined_parts: list[str] = []
+            input_mode = self._detect_input_mode(topic, context, image_paths, image_urls)
+            has_images = input_mode in {"image_only", "text_and_image"}
+            trajectory_run_id = self._start_trajectory(
+                workflow_kind="multi_head",
                 topic=topic,
                 image_paths=image_paths,
                 image_urls=image_urls,
-                limit=self.memory_recall_limit,
+                context=context,
+                input_mode=input_mode,
+                options={
+                    "task_heads": head_names,
+                    "use_search": use_search,
+                    "force_search": force_search,
+                    "iterative_search": iterative_search,
+                    "search_max_rounds": search_max_rounds,
+                    "controller_max_rounds": controller_max_rounds,
+                    "controller_confidence_threshold": controller_confidence_threshold,
+                },
             )
-            memory_card = self.memory_store.recall_card(topic)
-            memory_report = self.memory_store.format_records(
-                memory_records,
-                card=memory_card,
+            self._record_trajectory(
+                trajectory_run_id,
+                stage="input",
+                name="input_detected",
+                payload={
+                    "input_mode": input_mode,
+                    "topic": topic,
+                    "context": context,
+                    "image_paths": image_paths,
+                    "image_urls": image_urls,
+                    "task_heads": head_names,
+                },
             )
-            if memory_report:
-                combined_parts.append("Local memory:\n" + memory_report)
-                self._emit_progress(progress, "memory", "Local memory attached.")
-            else:
-                self._emit_progress(progress, "memory", "No local memory found.")
+            self._emit_progress(progress, "input", f"Input mode detected: {input_mode}.")
 
-        if has_images:
-            self._emit_progress(
-                progress,
-                "vision",
-                "Describing image content for retrieval and task heads.",
-            )
-            try:
-                visual_report = self.meme_agent.describe_images_for_search(
+            if context.strip():
+                combined_parts.append("[User Context]\n" + context.strip())
+
+            if self.memory_store:
+                self._emit_progress(progress, "memory", "Checking local MemeAgent memory.")
+                memory_records = self.memory_store.recall(
                     topic=topic,
-                    context=context,
                     image_paths=image_paths,
                     image_urls=image_urls,
+                    limit=self.memory_recall_limit,
                 )
-            except Exception as exc:
-                raise RuntimeError("Image pre-analysis LLM call failed.") from exc
-            self._emit_progress(progress, "vision", "Image-derived context ready.")
+                memory_card = self.memory_store.recall_card(topic)
+                memory_report = self.memory_store.format_records(
+                    memory_records,
+                    card=memory_card,
+                )
+                self._record_trajectory(
+                    trajectory_run_id,
+                    stage="memory",
+                    name="memory_recalled",
+                    payload={
+                        "record_count": len(memory_records),
+                        "has_topic_card": memory_card is not None,
+                        "memory_report": memory_report,
+                    },
+                )
+                if memory_report:
+                    combined_parts.append("Local memory:\n" + memory_report)
+                    self._emit_progress(progress, "memory", "Local memory attached.")
+                else:
+                    self._emit_progress(progress, "memory", "No local memory found.")
 
-        retrieval_plan, plan_label = self._prepare_retrieval_plan(
-            topic=topic,
-            context=context,
-            visual_report=visual_report,
-            input_mode=input_mode,
-            progress=progress,
-        )
-        if retrieval_plan:
-            combined_parts.append(f"{plan_label}:\n" + retrieval_plan)
-        self._emit_progress(progress, "planning", "External retrieval forced.")
-        search_report = self._run_search_with_reflection(
-            topic=topic,
-            context=context,
-            visual_report=visual_report,
-            retrieval_plan=retrieval_plan,
-            input_mode=input_mode,
-            iterative_search=iterative_search,
-            search_max_rounds=search_max_rounds,
-            progress=progress,
-        )
+            if has_images:
+                self._emit_progress(
+                    progress,
+                    "vision",
+                    "Describing image content for retrieval and task heads.",
+                )
+                try:
+                    visual_report = self.meme_agent.describe_images_for_search(
+                        topic=topic,
+                        context=context,
+                        image_paths=image_paths,
+                        image_urls=image_urls,
+                    )
+                except Exception as exc:
+                    raise RuntimeError("Image pre-analysis LLM call failed.") from exc
+                self._record_trajectory(
+                    trajectory_run_id,
+                    stage="vision",
+                    name="initial_visual_report",
+                    payload={"visual_report": visual_report},
+                )
+                self._emit_progress(progress, "vision", "Image-derived context ready.")
 
-        controller_report, visual_report, search_report = self._run_controller_analysis_loop(
-            topic=topic,
-            context=context,
-            visual_report=visual_report,
-            search_report=search_report,
-            input_mode=input_mode,
-            image_paths=image_paths,
-            image_urls=image_urls,
-            max_rounds=controller_max_rounds,
-            confidence_threshold=controller_confidence_threshold,
-            progress=progress,
-        )
-        if controller_report:
-            combined_parts.append(
-                "Controller planning and confidence report. Use these focus notes, "
-                "but still ground each task head in source labels:\n"
-                + controller_report
-            )
-        if visual_report:
-            combined_parts.append(
-                "Cumulative image analysis after controller-directed passes:\n"
-                + visual_report
-            )
-        if search_report:
-            combined_parts.append(
-                "Cumulative internet search findings after controller-directed passes. "
-                "Cite source labels exactly as shown:\n"
-                + search_report
-            )
-
-        combined_context = "\n\n".join(part for part in combined_parts if part).strip()
-        if search_ready:
-            search_ready(
-                input_mode,
-                search_report,
-                visual_report,
-                retrieval_plan,
-                controller_report,
-            )
-
-        head_list = ", ".join(head_names)
-        self._emit_progress(progress, "heads", f"Running task heads: {head_list}.")
-        runner = MemeAnalysisHeadRunner(
-            llm=self.meme_agent.llm,
-            system_prompt=self.meme_agent.system_prompt,
-        )
-        try:
-            head_results = runner.run_heads(
-                head_names=head_names,
+            retrieval_plan, plan_label = self._prepare_retrieval_plan(
                 topic=topic,
-                evidence_context=combined_context,
+                context=context,
+                visual_report=visual_report,
                 input_mode=input_mode,
+                progress=progress,
             )
-        except Exception as exc:
-            raise RuntimeError("Multi-head analysis LLM call failed.") from exc
-
-        formatted_output = format_head_results(head_results)
-        if self.memory_store:
-            self._emit_progress(progress, "memory", "Saving multi-head analysis to local memory.")
-            self.memory_store.remember(
+            self._record_trajectory(
+                trajectory_run_id,
+                stage="planning",
+                name="retrieval_plan_ready",
+                payload={"plan_label": plan_label, "retrieval_plan": retrieval_plan},
+            )
+            if retrieval_plan:
+                combined_parts.append(f"{plan_label}:\n" + retrieval_plan)
+            self._emit_progress(progress, "planning", "External retrieval forced.")
+            search_report = self._run_search_with_reflection(
                 topic=topic,
-                image_paths=image_paths,
-                image_urls=image_urls,
-                input_mode=input_mode,
-                analysis=formatted_output,
+                context=context,
                 visual_report=visual_report,
                 retrieval_plan=retrieval_plan,
-                search_report=search_report,
+                input_mode=input_mode,
+                iterative_search=iterative_search,
+                search_max_rounds=search_max_rounds,
+                progress=progress,
             )
-        self._emit_progress(progress, "heads", "Task heads ready.")
-        return MultiHeadWorkflowResult(
-            head_results=head_results,
-            formatted_output=formatted_output,
-            search_report=search_report,
-            combined_context=combined_context,
-            visual_report=visual_report,
-            retrieval_plan=retrieval_plan,
-            controller_report=controller_report,
-            memory_report=memory_report,
-            input_mode=input_mode,
-        )
+            self._record_trajectory(
+                trajectory_run_id,
+                stage="search",
+                name="search_report_ready",
+                payload={"search_report": search_report},
+            )
+
+            controller_report, visual_report, search_report = self._run_controller_analysis_loop(
+                topic=topic,
+                context=context,
+                visual_report=visual_report,
+                search_report=search_report,
+                input_mode=input_mode,
+                image_paths=image_paths,
+                image_urls=image_urls,
+                max_rounds=controller_max_rounds,
+                confidence_threshold=controller_confidence_threshold,
+                progress=progress,
+            )
+            self._record_trajectory(
+                trajectory_run_id,
+                stage="controller",
+                name="controller_loop_ready",
+                payload={
+                    "controller_report": controller_report,
+                    "visual_report": visual_report,
+                    "search_report": search_report,
+                },
+            )
+            if controller_report:
+                combined_parts.append(
+                    "Controller planning and confidence report. Use these focus notes, "
+                    "but still ground each task head in source labels:\n"
+                    + controller_report
+                )
+            if visual_report:
+                combined_parts.append(
+                    "Cumulative image analysis after controller-directed passes:\n"
+                    + visual_report
+                )
+            if search_report:
+                combined_parts.append(
+                    "Cumulative internet search findings after controller-directed passes. "
+                    "Cite source labels exactly as shown:\n"
+                    + search_report
+                )
+
+            combined_context = "\n\n".join(part for part in combined_parts if part).strip()
+            self._record_trajectory(
+                trajectory_run_id,
+                stage="context",
+                name="combined_context_ready",
+                payload={"combined_context": combined_context},
+            )
+            if search_ready:
+                search_ready(
+                    input_mode,
+                    search_report,
+                    visual_report,
+                    retrieval_plan,
+                    controller_report,
+                )
+
+            head_list = ", ".join(head_names)
+            self._emit_progress(progress, "heads", f"Running task heads: {head_list}.")
+            runner = MemeAnalysisHeadRunner(
+                llm=self.meme_agent.llm,
+                system_prompt=self.meme_agent.system_prompt,
+            )
+            try:
+                head_results = runner.run_heads(
+                    head_names=head_names,
+                    topic=topic,
+                    evidence_context=combined_context,
+                    input_mode=input_mode,
+                )
+            except Exception as exc:
+                raise RuntimeError("Multi-head analysis LLM call failed.") from exc
+
+            formatted_output = format_head_results(head_results)
+            head_payload = [
+                {"name": result.name, "title": result.title, "output": result.output}
+                for result in head_results
+            ]
+            self._record_trajectory(
+                trajectory_run_id,
+                stage="heads",
+                name="head_outputs_ready",
+                payload={
+                    "head_names": head_names,
+                    "head_results": head_payload,
+                    "formatted_output": formatted_output,
+                },
+            )
+            if self.memory_store:
+                self._emit_progress(progress, "memory", "Saving multi-head analysis to local memory.")
+                self.memory_store.remember(
+                    topic=topic,
+                    image_paths=image_paths,
+                    image_urls=image_urls,
+                    input_mode=input_mode,
+                    analysis=formatted_output,
+                    visual_report=visual_report,
+                    retrieval_plan=retrieval_plan,
+                    search_report=search_report,
+                )
+                self._record_trajectory(
+                    trajectory_run_id,
+                    stage="memory",
+                    name="analysis_saved",
+                    payload={"saved": True},
+                )
+            output_payload = {
+                "input_mode": input_mode,
+                "head_names": head_names,
+                "head_results": head_payload,
+                "formatted_output": formatted_output,
+                "combined_context": combined_context,
+                "memory_report": memory_report,
+                "visual_report": visual_report,
+                "retrieval_plan": retrieval_plan,
+                "search_report": search_report,
+                "controller_report": controller_report,
+            }
+            self._finish_trajectory(trajectory_run_id, output=output_payload)
+            self._emit_progress(progress, "heads", "Task heads ready.")
+            return MultiHeadWorkflowResult(
+                head_results=head_results,
+                formatted_output=formatted_output,
+                search_report=search_report,
+                combined_context=combined_context,
+                visual_report=visual_report,
+                retrieval_plan=retrieval_plan,
+                controller_report=controller_report,
+                memory_report=memory_report,
+                input_mode=input_mode,
+                trajectory_run_id=trajectory_run_id,
+            )
+        except Exception as exc:
+            self._fail_trajectory(
+                trajectory_run_id,
+                error=exc,
+                output={
+                    "input_mode": input_mode,
+                    "combined_context": combined_context,
+                    "formatted_output": formatted_output,
+                    "memory_report": memory_report,
+                    "visual_report": visual_report,
+                    "retrieval_plan": retrieval_plan,
+                    "search_report": search_report,
+                    "controller_report": controller_report,
+                },
+            )
+            raise

@@ -52,6 +52,8 @@ class MemeAgentConfig:
     cache_dir: str
     search_cache_ttl_seconds: int
     news_cache_ttl_seconds: int
+    trajectory_cache_enabled: bool
+    trajectory_cache_dir: str
     memory_enabled: bool
     memory_dir: str
     memory_recall_limit: int
@@ -81,6 +83,9 @@ class MemeAgentConfig:
             os.getenv("MEMEAGENT_CONTROLLER_THINKING", "true").strip().lower()
         )
         cache_enabled = os.getenv("MEMEAGENT_CACHE_ENABLED", "true").strip().lower()
+        trajectory_cache_enabled = (
+            os.getenv("MEMEAGENT_TRAJECTORY_CACHE_ENABLED", "true").strip().lower()
+        )
         memory_enabled = os.getenv("MEMEAGENT_MEMORY_ENABLED", "true").strip().lower()
         return cls(
             provider=provider,
@@ -185,6 +190,13 @@ class MemeAgentConfig:
             news_cache_ttl_seconds=int(
                 os.getenv("MEMEAGENT_NEWS_CACHE_TTL_SECONDS", str(6 * 60 * 60))
             ),
+            trajectory_cache_enabled=trajectory_cache_enabled
+            not in {"0", "false", "no", "off"},
+            trajectory_cache_dir=(
+                os.getenv("MEMEAGENT_TRAJECTORY_CACHE_DIR")
+                or os.getenv("MEMEAGENT_CACHE_DIR")
+                or ".memeagent_cache"
+            ).strip(),
             memory_enabled=memory_enabled not in {"0", "false", "no", "off"},
             memory_dir=os.getenv("MEMEAGENT_MEMORY_DIR", ".memeagent_memory").strip(),
             memory_recall_limit=int(os.getenv("MEMEAGENT_MEMORY_RECALL_LIMIT", "3")),

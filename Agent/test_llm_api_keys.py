@@ -47,6 +47,8 @@ def _config(**overrides: object) -> MemeAgentConfig:
         "cache_dir": ".memeagent_cache",
         "search_cache_ttl_seconds": 7 * 24 * 60 * 60,
         "news_cache_ttl_seconds": 6 * 60 * 60,
+        "trajectory_cache_enabled": True,
+        "trajectory_cache_dir": ".memeagent_cache",
         "memory_enabled": True,
         "memory_dir": ".memeagent_memory",
         "memory_recall_limit": 3,

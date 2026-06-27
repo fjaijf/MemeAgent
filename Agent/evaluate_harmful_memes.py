@@ -18,6 +18,7 @@ from memeagent.config import MemeAgentConfig, load_project_env
 from memeagent.llm import create_controller_llm, create_llm
 from memeagent.memory import MemeMemoryStore
 from memeagent.search_agent import SearchAgentConfig, WebSearchAgent
+from memeagent.trajectory import MemeTrajectoryCache
 from memeagent.workflow import MemeResearchWorkflow
 
 
@@ -402,7 +403,12 @@ def predict_direct(agent: MemeAgent, item: EvalItem) -> Prediction:
     return _prediction_from_text(output)
 
 
-def make_workflow(config: MemeAgentConfig, project_root: Path, disable_memory: bool) -> MemeResearchWorkflow:
+def make_workflow(
+    config: MemeAgentConfig,
+    project_root: Path,
+    disable_memory: bool,
+    disable_trajectory_cache: bool = False,
+) -> MemeResearchWorkflow:
     llm = create_llm(config)
     agent = MemeAgent(llm=llm, system_prompt=config.system_prompt)
     controller_llm = create_controller_llm(config)
@@ -422,6 +428,12 @@ def make_workflow(config: MemeAgentConfig, project_root: Path, disable_memory: b
     memory_store = None
     if config.memory_enabled and not disable_memory:
         memory_store = MemeMemoryStore(memory_dir / "memory.sqlite3")
+    trajectory_cache = None
+    if config.trajectory_cache_enabled and not disable_trajectory_cache:
+        trajectory_cache_dir = Path(config.trajectory_cache_dir).expanduser()
+        if not trajectory_cache_dir.is_absolute():
+            trajectory_cache_dir = project_root / trajectory_cache_dir
+        trajectory_cache = MemeTrajectoryCache(trajectory_cache_dir / "trajectory.sqlite3")
 
     return MemeResearchWorkflow(
         meme_agent=agent,
@@ -453,6 +465,7 @@ def make_workflow(config: MemeAgentConfig, project_root: Path, disable_memory: b
         ),
         memory_store=memory_store,
         memory_recall_limit=config.memory_recall_limit,
+        trajectory_cache=trajectory_cache,
     )
 
 
@@ -604,6 +617,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--disable-memory", action="store_true", help="Do not read/write local memory.")
     parser.add_argument(
+        "--disable-trajectory-cache",
+        action="store_true",
+        help="Do not record end-to-end workflow trajectories.",
+    )
+    parser.add_argument(
         "--include-unlabeled",
         action="store_true",
         help="Also run samples whose ground-truth label cannot be parsed.",
@@ -654,7 +672,12 @@ def main() -> int:
     config = MemeAgentConfig.from_env()
     workflow = None
     if args.mode == "workflow":
-        workflow = make_workflow(config, project_root, disable_memory=args.disable_memory)
+        workflow = make_workflow(
+            config,
+            project_root,
+            disable_memory=args.disable_memory,
+            disable_trajectory_cache=args.disable_trajectory_cache,
+        )
         if args.workers > 1:
             print("--workers is only used in direct mode; workflow mode will run sequentially.")
 

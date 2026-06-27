@@ -13,6 +13,7 @@ from .heads import (
 from .llm import create_llm
 from .memory import MemeMemoryStore, MemoryCard, MemoryRecord
 from .search_agent import SearchAgentConfig, WebSearchAgent
+from .trajectory import MemeTrajectoryCache, TrajectoryEvent, TrajectoryRun
 from .workflow import MemeResearchWorkflow, MultiHeadWorkflowResult, WorkflowResult
 
 __all__ = [
@@ -27,9 +28,12 @@ __all__ = [
     "MemeMemoryStore",
     "MemoryCard",
     "MemoryRecord",
+    "MemeTrajectoryCache",
     "MultiHeadWorkflowResult",
     "SearchAgentConfig",
     "SearchResultCache",
+    "TrajectoryEvent",
+    "TrajectoryRun",
     "WebSearchAgent",
     "WorkflowResult",
     "create_llm",

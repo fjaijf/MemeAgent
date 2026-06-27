@@ -11,6 +11,7 @@ from memeagent.heads import HEADS
 from memeagent.llm import create_controller_llm, create_llm
 from memeagent.memory import MemeMemoryStore
 from memeagent.search_agent import SearchAgentConfig, WebSearchAgent
+from memeagent.trajectory import MemeTrajectoryCache
 from memeagent.workflow import MemeResearchWorkflow
 
 
@@ -177,6 +178,11 @@ def parse_args() -> argparse.Namespace:
         help="Override news search cache TTL in seconds.",
     )
     parser.add_argument(
+        "--no-trajectory-cache",
+        action="store_true",
+        help="Disable end-to-end workflow trajectory recording for this run.",
+    )
+    parser.add_argument(
         "--plain",
         action="store_true",
         help="Disable rich terminal visuals and print plain text output.",
@@ -273,12 +279,22 @@ def main() -> None:
         search_overrides["search_cache_ttl_seconds"] = args.search_cache_ttl_seconds
     if args.news_cache_ttl_seconds is not None:
         search_overrides["news_cache_ttl_seconds"] = args.news_cache_ttl_seconds
+    if args.no_trajectory_cache:
+        search_overrides["trajectory_cache_enabled"] = False
     if search_overrides:
         config = replace(config, **search_overrides)
     cache_dir = Path(config.cache_dir).expanduser()
     if not cache_dir.is_absolute():
         cache_dir = project_root / cache_dir
     search_cache_path = str(cache_dir / "search.sqlite3")
+    trajectory_cache_dir = Path(config.trajectory_cache_dir).expanduser()
+    if not trajectory_cache_dir.is_absolute():
+        trajectory_cache_dir = project_root / trajectory_cache_dir
+    trajectory_cache = (
+        MemeTrajectoryCache(trajectory_cache_dir / "trajectory.sqlite3")
+        if config.trajectory_cache_enabled
+        else None
+    )
     memory_dir = Path(config.memory_dir).expanduser()
     if not memory_dir.is_absolute():
         memory_dir = project_root / memory_dir
@@ -328,6 +344,7 @@ def main() -> None:
         search_agent=search_agent,
         memory_store=memory_store,
         memory_recall_limit=config.memory_recall_limit,
+        trajectory_cache=trajectory_cache,
     )
     ui = MemeAgentCLI(
         enabled=not args.plain,
