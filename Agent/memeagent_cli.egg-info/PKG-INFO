@@ -10,6 +10,12 @@ Requires-Dist: python-dotenv>=1.0.0
 Requires-Dist: ddgs>=8.0.0
 Requires-Dist: rich>=13.7.0
 Requires-Dist: openai>=1.0.0
+Provides-Extra: local
+Requires-Dist: accelerate>=0.33.0; extra == "local"
+Requires-Dist: pillow>=10.0.0; extra == "local"
+Requires-Dist: torch>=2.6.0; extra == "local"
+Requires-Dist: torchvision>=0.21.0; extra == "local"
+Requires-Dist: transformers>=4.57.1; extra == "local"
 
 # MemeAgent
 
@@ -27,8 +33,10 @@ analysis, modeled after the way `TradingAgents` creates and calls LLMs:
 - `memeagent/llm.py`: creates the model client
 - `memeagent/agent.py`: contains the actual agent logic
 - `memeagent/search_agent.py`: retrieves public web and news context
+- `memeagent/retrieve_cli.py`: standalone retrieval CLI without LLM calls
 - `memeagent/workflow.py`: coordinates retrieval + meme analysis
 - `main.py`: command-line entrypoint
+- `retrieve.py`: command-line entrypoint for retrieval-only tuning
 
 ## Quick Start
 
@@ -81,24 +89,117 @@ MEMEAGENT_TIMEOUT=180
 MEMEAGENT_MAX_TOKENS=1200
 ```
 
-To search the public web first and feed the results into the analysis:
+To use GLM as a separate controller for retrieval planning and retrieval
+reflection while keeping the primary model for vision/final analysis:
+
+```bash
+MEMEAGENT_PROVIDER=openai-compatible
+OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+MEMEAGENT_MODEL=qwen3.7-plus
+DASHSCOPE_API_KEY=your_dashscope_api_key
+
+MEMEAGENT_CONTROLLER_PROVIDER=glm
+MEMEAGENT_CONTROLLER_MODEL=glm-5.1
+MEMEAGENT_CONTROLLER_THINKING=true
+ZAI_API_KEY=your_zai_api_key
+```
+
+To run the agent with locally deployed Hugging Face models while keeping the
+remote GLM/Qwen API configuration available, set the main multimodal model and
+controller model separately:
+
+```bash
+MEMEAGENT_PROVIDER=local-transformers
+MEMEAGENT_MODEL=/data/ggbond/Qwen3.6-27B
+MEMEAGENT_LOCAL_THINKING=false
+MEMEAGENT_LOCAL_STRIP_THINKING=true
+MEMEAGENT_LOCAL_MAX_NEW_TOKENS=2048
+
+MEMEAGENT_CONTROLLER_PROVIDER=local-transformers
+MEMEAGENT_CONTROLLER_MODEL=/data/ggbond/Qwen3-32B
+MEMEAGENT_CONTROLLER_THINKING=true
+```
+
+Local mode loads models through Hugging Face Transformers. Install the optional
+dependencies before using it:
+
+```bash
+pip install -e ".[local]"
+# or
+pip install -r requirements-local.txt
+```
+
+MemeAgent runs public web/news retrieval before analysis by default:
 
 ```bash
 python main.py --topic "PEPE" --search --show-search
 ```
 
-The CLI shows a terminal status panel and live activity indicator while it waits
-for image pre-analysis, retrieval, and final LLM analysis. For plain text output
-in logs or batch jobs, add:
+The legacy `--force-search` flag is still accepted and has the same forced
+retrieval behavior:
 
 ```bash
+python main.py --topic "PEPE" --force-search --show-search
+```
+
+To tune retrieval without spending tokens on planning, vision, or final
+analysis, use the retrieval-only entrypoint:
+
+```bash
+python retrieve.py --topic "PEPE" --mode plan
+python retrieve.py --topic "PEPE" --mode both
+python retrieve.py --query '"this is fine"' --mode web
+python retrieve.py --topic "PEPE" --context-file notes.txt --json --output runs/retrieval.json
+```
+
+If installed with `pip install -e .`, the same tool is available as:
+
+```bash
+meme-retrieve --topic "PEPE" --mode both
+```
+
+The CLI shows a live workflow timeline while it waits for image pre-analysis,
+controller planning, confidence scoring, follow-up image analysis, retrieval,
+and final LLM analysis. It displays auditable planning summaries and progress
+events, not hidden chain-of-thought text. For plain text output in logs or batch
+jobs, add:
+
+```bash
+python main.py --image path/to/meme.png --trace-mode live
+```
+
+`--trace-mode live` shows the trace only while the workflow is running and clears
+it before printing the final output. To disable the live trace:
+
+```bash
+python main.py --topic "PEPE" --trace-mode off
 python main.py --topic "PEPE" --search --show-search --plain
+```
+
+MemeAgent also records a persistent workflow trajectory by default at
+`.memeagent_cache/trajectory.sqlite3`. This cache stores the input payload,
+memory report, visual report, retrieval plan, search report, controller report,
+combined context, final output, and failed-run error state. It records observable
+workflow artifacts and model outputs, not hidden chain-of-thought text.
+
+```bash
+python main.py --topic "PEPE" --no-trajectory-cache
+MEMEAGENT_TRAJECTORY_CACHE_ENABLED=false
+MEMEAGENT_TRAJECTORY_CACHE_DIR=.memeagent_cache
 ```
 
 To stream the final analysis as it is generated, add:
 
 ```bash
 python main.py --topic "PEPE" --search --stream
+```
+
+Streaming uses plain incremental text by default so Markdown does not jump or
+re-render while the model is still generating. If you prefer live Markdown
+rendering, add:
+
+```bash
+python main.py --topic "PEPE" --search --stream --stream-markdown
 ```
 
 MemeAgent supports three input modes:
@@ -114,6 +215,37 @@ python main.py --image path/to/meme.png --search --show-search
 python main.py --topic "a meme name or phrase" --image path/to/meme.png --search --show-search
 ```
 
+After the initial QwenVL image pass and forced retrieval, MemeAgent uses the
+controller model to plan rubric-driven follow-up analysis. The controller checks
+harmfulness, sentiment, audience, intent, and evolution coverage, emits
+`ITERATION_CONFIDENCE`, and asks for more image analysis or retrieval when the
+score is below the threshold. The default threshold is `0.8`:
+
+```bash
+python main.py --image path/to/meme.png --show-search \
+  --controller-confidence-threshold 0.8 \
+  --controller-max-rounds 3
+```
+
+## Evaluation Script
+
+For harmful meme detection benchmarks, use the dedicated evaluator:
+
+```bash
+python evaluate_harmful_memes.py --dataset D:\自研Agent\Dataset\label_test.json --mode direct --resume
+```
+
+Common options:
+
+```bash
+python evaluate_harmful_memes.py --dataset D:\自研Agent\Dataset\label_test.json --schema auto --workers 4
+python evaluate_harmful_memes.py --dataset D:\自研Agent\Dataset\label_test.json --mode workflow --search
+python evaluate_harmful_memes.py --dataset D:\自研Agent\Dataset\label_test.json --limit 100 --workers 4 --output runs/eval.jsonl
+```
+
+The script writes per-sample predictions to JSONL and a summary metric file
+with accuracy, precision, recall, and F1.
+
 When images are attached, MemeAgent first asks the vision model to produce an
 OCR/visual-description/keyword report. That image-derived report is then used
 as additional search context before the final meme analysis:
@@ -122,11 +254,11 @@ as additional search context before the final meme analysis:
 python main.py --image path/to/meme.png --search --show-search
 ```
 
-When search is enabled, MemeAgent also asks the LLM for a constrained
-supplemental retrieval plan. The stable OCR/visual-anchor queries remain the
-primary search inputs; the LLM plan can add only a few extra web/news queries
-when the input provides concrete people, events, OCR phrases, platforms, or
-background clues.
+Before final analysis, MemeAgent always plans and runs external web/news
+retrieval. The stable OCR/visual-anchor queries remain the primary search inputs;
+the controller can add follow-up web/news queries when the input provides
+concrete people, events, OCR phrases, platforms, sensitive-event clues, or
+template/evolution anchors.
 
 The search agent currently gathers research context for:
 
@@ -163,11 +295,58 @@ MEMEAGENT_SEARCH_PROVIDER=zhihu
 MEMEAGENT_ZHIHU_API_KEY=your_zhihu_access_secret
 ```
 
+To use Anspire Search:
+
+```bash
+MEMEAGENT_SEARCH_PROVIDER=anspire
+MEMEAGENT_ANSPIRE_API_KEY=your_anspire_api_key
+```
+
+The Anspire demo runs the same retrieve pipeline with `search_provider=anspire`
+without changing your default provider:
+
+```bash
+python retrieve_anspire_demo.py --topic "meme sentiment analysis" --max-results 3
+```
+
+To use GLM/Zhipu's web search API:
+
+```bash
+MEMEAGENT_SEARCH_PROVIDER=glm
+ZAI_API_KEY=your_zai_api_key
+MEMEAGENT_GLM_SEARCH_ENGINE=search_pro
+MEMEAGENT_GLM_SEARCH_RECENCY_FILTER=noLimit
+MEMEAGENT_GLM_SEARCH_CONTENT_SIZE=medium
+```
+
+Optional GLM domain filtering:
+
+```bash
+MEMEAGENT_GLM_SEARCH_DOMAIN_FILTER=www.sohu.com
+```
+
+The GLM search provider uses the `zhipuai` Python package. Install it if you
+select `MEMEAGENT_SEARCH_PROVIDER=glm`:
+
+```bash
+pip install zhipuai
+```
+
 If the selected search API needs a local HTTP proxy, set:
 
 ```bash
 MEMEAGENT_SEARCH_PROXY=http://127.0.0.1:7890
 ```
+
+Thread/Page Context fetching can use a proxy only when direct page fetching
+fails with connection, timeout, or retryable HTTP errors:
+
+```bash
+MEMEAGENT_CONTEXT_PROXY=http://127.0.0.1:7890
+```
+
+If `MEMEAGENT_CONTEXT_PROXY` is not set, it falls back to
+`MEMEAGENT_SEARCH_PROXY`.
 
 ## How This Maps To TradingAgents
 

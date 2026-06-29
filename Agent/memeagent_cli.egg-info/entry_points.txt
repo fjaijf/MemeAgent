@@ -1,3 +1,4 @@
 [console_scripts]
 meme = main:main
+meme-retrieve = memeagent.retrieve_cli:main
 memeagent = main:main

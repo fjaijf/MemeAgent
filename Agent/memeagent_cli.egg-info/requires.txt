@@ -4,3 +4,10 @@ python-dotenv>=1.0.0
 ddgs>=8.0.0
 rich>=13.7.0
 openai>=1.0.0
+
+[local]
+accelerate>=0.33.0
+pillow>=10.0.0
+torch>=2.6.0
+torchvision>=0.21.0
+transformers>=4.57.1

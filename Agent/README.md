@@ -110,6 +110,35 @@ pip install -e ".[local]"
 pip install -r requirements-local.txt
 ```
 
+To keep both local models loaded as a long-running OpenAI-compatible service,
+configure service model names and paths:
+
+```bash
+MEMEAGENT_PROVIDER=openai-compatible
+OPENAI_BASE_URL=http://127.0.0.1:8008/v1
+OPENAI_API_KEY=local-memeagent
+MEMEAGENT_MODEL=memeagent-main
+
+MEMEAGENT_CONTROLLER_PROVIDER=openai-compatible
+MEMEAGENT_CONTROLLER_MODEL=memeagent-controller
+
+MEMEAGENT_SERVICE_MAIN_MODEL=memeagent-main
+MEMEAGENT_SERVICE_MAIN_MODEL_PATH=/data/ggbond/Qwen3.6-27B
+MEMEAGENT_SERVICE_CONTROLLER_MODEL=memeagent-controller
+MEMEAGENT_SERVICE_CONTROLLER_MODEL_PATH=/data/ggbond/Qwen3-32B
+```
+
+Start the service once, then run `main.py` in separate commands:
+
+```bash
+python local_inference_server.py
+python main.py --topic "PEPE"
+```
+
+The service process owns the loaded model weights and GPU memory. `main.py`
+calls the service through `/v1/chat/completions` instead of loading weights
+inside the CLI process.
+
 MemeAgent runs public web/news retrieval before analysis by default:
 
 ```bash
