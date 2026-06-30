@@ -38,12 +38,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--search",
         action="store_true",
-        help="Compatibility flag; retrieval is always enabled.",
+        help="Enable external retrieval for this run.",
+    )
+    parser.add_argument(
+        "--no-search",
+        action="store_true",
+        help="Disable external retrieval; analyze only with the agent and local context.",
     )
     parser.add_argument(
         "--force-search",
         action="store_true",
-        help="Compatibility flag; retrieval is always forced.",
+        help="Force external retrieval planning when retrieval is enabled.",
     )
     parser.add_argument(
         "--show-search",
@@ -58,7 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--search-max-rounds",
         type=int,
-        default=3,
+        default=5,
         help="Maximum retrieval rounds when --iterative-search is enabled.",
     )
     parser.add_argument(
@@ -225,7 +230,6 @@ def main() -> None:
     project_root = Path(__file__).resolve().parent
     load_project_env(project_root)
     args = parse_args()
-    search_requested = True
 
     if args.list_tasks:
         print("Available MemeAgent task heads:")
@@ -235,6 +239,11 @@ def main() -> None:
         return
 
     config = MemeAgentConfig.from_env()
+    search_requested = config.search_enabled
+    if args.search:
+        search_requested = True
+    if args.no_search:
+        search_requested = False
     search_overrides = {}
     if args.search_provider is not None:
         search_overrides["search_provider"] = args.search_provider.strip()

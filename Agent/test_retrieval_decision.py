@@ -187,7 +187,7 @@ class FakeSearchAgent:
 
 
 class ForcedRetrievalWorkflowTests(unittest.TestCase):
-    def test_run_always_plans_and_searches_even_when_search_flags_are_false(self) -> None:
+    def test_run_skips_retrieval_when_search_is_disabled(self) -> None:
         meme_agent = FakeMemeAgent()
         search_agent = FakeSearchAgent()
         workflow = MemeResearchWorkflow(meme_agent=meme_agent, search_agent=search_agent)
@@ -198,16 +198,16 @@ class ForcedRetrievalWorkflowTests(unittest.TestCase):
             force_search=False,
         )
 
-        self.assertEqual(1, meme_agent.plan_calls)
+        self.assertEqual(0, meme_agent.plan_calls)
         self.assertEqual(1, meme_agent.controller_calls)
-        self.assertEqual(1, search_agent.calls)
-        self.assertIn("Forced retrieval plan", result.combined_context)
+        self.assertEqual(0, search_agent.calls)
+        self.assertNotIn("Forced retrieval plan", result.combined_context)
         self.assertIn("Controller planning and confidence report", result.combined_context)
-        self.assertIn("Cumulative internet search findings", result.combined_context)
-        self.assertIn("[W1] Search evidence", result.search_report)
-        self.assertIn("forced meme context", search_agent.context)
+        self.assertNotIn("Cumulative internet search findings", result.combined_context)
+        self.assertEqual("", result.search_report)
+        self.assertEqual("", search_agent.context)
 
-    def test_run_heads_always_plans_and_searches_even_when_search_flags_are_false(self) -> None:
+    def test_run_heads_skips_retrieval_when_search_is_disabled(self) -> None:
         meme_agent = FakeHeadMemeAgent()
         search_agent = FakeSearchAgent()
         workflow = MemeResearchWorkflow(meme_agent=meme_agent, search_agent=search_agent)
@@ -223,13 +223,13 @@ class ForcedRetrievalWorkflowTests(unittest.TestCase):
                 force_search=False,
             )
 
-        self.assertEqual(1, meme_agent.plan_calls)
+        self.assertEqual(0, meme_agent.plan_calls)
         self.assertEqual(1, meme_agent.controller_calls)
-        self.assertEqual(1, search_agent.calls)
-        self.assertIn("Forced retrieval plan", result.combined_context)
+        self.assertEqual(0, search_agent.calls)
+        self.assertNotIn("Forced retrieval plan", result.combined_context)
         self.assertIn("Controller planning and confidence report", result.combined_context)
-        self.assertIn("Cumulative internet search findings", result.combined_context)
-        self.assertIn("[W1] Search evidence", result.search_report)
+        self.assertNotIn("Cumulative internet search findings", result.combined_context)
+        self.assertEqual("", result.search_report)
 
     def test_low_controller_confidence_triggers_followup_image_analysis_and_search(self) -> None:
         meme_agent = LowThenHighControllerMemeAgent()
@@ -250,6 +250,26 @@ class ForcedRetrievalWorkflowTests(unittest.TestCase):
         self.assertIn("Parsed confidence: 0.90", result.controller_report)
         self.assertIn("Follow-up image analysis confirms OCR", result.visual_report)
         self.assertIn("Controller-Directed Retrieval Round 2", result.search_report)
+
+    def test_low_controller_confidence_skips_followup_search_when_search_is_disabled(self) -> None:
+        meme_agent = LowThenHighControllerMemeAgent()
+        search_agent = FakeSearchAgent()
+        workflow = MemeResearchWorkflow(meme_agent=meme_agent, search_agent=search_agent)
+
+        result = workflow.run(
+            topic="image meme",
+            image_paths=["test.png"],
+            use_search=False,
+            controller_max_rounds=3,
+            controller_confidence_threshold=0.8,
+        )
+
+        self.assertEqual(2, meme_agent.controller_calls)
+        self.assertEqual(1, meme_agent.image_followups)
+        self.assertEqual(0, search_agent.calls)
+        self.assertIn("Follow-up image analysis confirms OCR", result.visual_report)
+        self.assertEqual("", result.search_report)
+        self.assertNotIn("Controller-Directed Retrieval Round 2", result.controller_report)
 
     def test_controller_stops_when_confidence_reaches_threshold(self) -> None:
         meme_agent = HighConfidenceNoFinalizeMemeAgent()

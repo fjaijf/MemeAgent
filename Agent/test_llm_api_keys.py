@@ -24,6 +24,7 @@ def _config(**overrides: object) -> MemeAgentConfig:
         "controller_max_tokens": None,
         "controller_max_retries": 0,
         "controller_thinking_enabled": True,
+        "search_enabled": True,
         "search_provider": "ddgs",
         "search_api_key": None,
         "tavily_api_key": None,

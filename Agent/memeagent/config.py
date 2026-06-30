@@ -29,6 +29,7 @@ class MemeAgentConfig:
     controller_max_tokens: int | None
     controller_max_retries: int
     controller_thinking_enabled: bool
+    search_enabled: bool
     search_provider: str
     search_api_key: str | None
     tavily_api_key: str | None
@@ -83,6 +84,7 @@ class MemeAgentConfig:
             os.getenv("MEMEAGENT_CONTROLLER_THINKING", "true").strip().lower()
         )
         cache_enabled = os.getenv("MEMEAGENT_CACHE_ENABLED", "true").strip().lower()
+        search_enabled = os.getenv("MEMEAGENT_SEARCH_ENABLED", "true").strip().lower()
         trajectory_cache_enabled = (
             os.getenv("MEMEAGENT_TRAJECTORY_CACHE_ENABLED", "true").strip().lower()
         )
@@ -119,6 +121,8 @@ class MemeAgentConfig:
                 "off",
                 "disabled",
             },
+            search_enabled=search_enabled
+            not in {"0", "false", "no", "off", "disabled"},
             search_provider=os.getenv("MEMEAGENT_SEARCH_PROVIDER", "ddgs").strip(),
             search_api_key=(
                 os.getenv("MEMEAGENT_SEARCH_API_KEY", "").strip().strip('"').strip("'")

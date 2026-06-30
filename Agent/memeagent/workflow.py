@@ -339,6 +339,7 @@ class MemeResearchWorkflow:
         image_urls: list[str],
         max_rounds: int,
         confidence_threshold: float,
+        allow_retrieval: bool,
         progress: Callable[[str, str], None] | None,
     ) -> tuple[str, str, str]:
         max_rounds = max(1, max_rounds)
@@ -393,7 +394,12 @@ class MemeResearchWorkflow:
             self._emit_progress(
                 progress,
                 "controller",
-                "Confidence below threshold; requesting follow-up image analysis and retrieval.",
+                (
+                    "Confidence below threshold; requesting follow-up image analysis "
+                    "and retrieval."
+                    if allow_retrieval
+                    else "Confidence below threshold; requesting follow-up image analysis."
+                ),
             )
             followup_visual = self._analyze_images_for_controller_plan(
                 topic=topic,
@@ -414,30 +420,31 @@ class MemeResearchWorkflow:
                     f"## Follow-up Image Analysis Round {round_index}\n\n{followup_visual}"
                 )
 
-            self._emit_progress(
-                progress,
-                "search",
-                f"Collecting controller-directed retrieval round {round_index + 1}.",
-            )
-            followup_context = (
-                f"{context}\n\n"
-                f"Controller plan for round {round_index + 1}:\n{controller_plan}"
-            )
-            if followup_visual:
-                followup_context += f"\n\nFollow-up image analysis:\n{followup_visual}"
-            followup_report = self._label_search_report(
-                self.search_agent.run(topic=topic, context=followup_context),
-                round_index=round_index + 1,
-            )
-            cumulative_search_report = (
-                f"{cumulative_search_report}\n\n"
-                f"## Controller-Directed Retrieval Round {round_index + 1}\n\n"
-                f"{followup_report}"
-            ).strip()
-            round_blocks.append(
-                f"## Controller-Directed Retrieval Round {round_index + 1}\n\n"
-                f"{followup_report}"
-            )
+            if allow_retrieval:
+                self._emit_progress(
+                    progress,
+                    "search",
+                    f"Collecting controller-directed retrieval round {round_index + 1}.",
+                )
+                followup_context = (
+                    f"{context}\n\n"
+                    f"Controller plan for round {round_index + 1}:\n{controller_plan}"
+                )
+                if followup_visual:
+                    followup_context += f"\n\nFollow-up image analysis:\n{followup_visual}"
+                followup_report = self._label_search_report(
+                    self.search_agent.run(topic=topic, context=followup_context),
+                    round_index=round_index + 1,
+                )
+                cumulative_search_report = (
+                    f"{cumulative_search_report}\n\n"
+                    f"## Controller-Directed Retrieval Round {round_index + 1}\n\n"
+                    f"{followup_report}"
+                ).strip()
+                round_blocks.append(
+                    f"## Controller-Directed Retrieval Round {round_index + 1}\n\n"
+                    f"{followup_report}"
+                )
 
         return "\n\n".join(round_blocks), cumulative_visual_report, cumulative_search_report
 
@@ -657,38 +664,47 @@ class MemeResearchWorkflow:
                 )
                 self._emit_progress(progress, "vision", "Image-derived search context ready.")
 
-            retrieval_plan, plan_label = self._prepare_retrieval_plan(
-                topic=topic,
-                context=context,
-                visual_report=visual_report,
-                input_mode=input_mode,
-                progress=progress,
-            )
-            self._record_trajectory(
-                trajectory_run_id,
-                stage="planning",
-                name="retrieval_plan_ready",
-                payload={"plan_label": plan_label, "retrieval_plan": retrieval_plan},
-            )
-            if retrieval_plan:
-                combined_parts.append(f"{plan_label}:\n" + retrieval_plan)
-            self._emit_progress(progress, "planning", "External retrieval forced.")
-            search_report = self._run_search_with_reflection(
-                topic=topic,
-                context=context,
-                visual_report=visual_report,
-                retrieval_plan=retrieval_plan,
-                input_mode=input_mode,
-                iterative_search=iterative_search,
-                search_max_rounds=search_max_rounds,
-                progress=progress,
-            )
-            self._record_trajectory(
-                trajectory_run_id,
-                stage="search",
-                name="search_report_ready",
-                payload={"search_report": search_report},
-            )
+            if use_search:
+                retrieval_plan, plan_label = self._prepare_retrieval_plan(
+                    topic=topic,
+                    context=context,
+                    visual_report=visual_report,
+                    input_mode=input_mode,
+                    progress=progress,
+                )
+                self._record_trajectory(
+                    trajectory_run_id,
+                    stage="planning",
+                    name="retrieval_plan_ready",
+                    payload={"plan_label": plan_label, "retrieval_plan": retrieval_plan},
+                )
+                if retrieval_plan:
+                    combined_parts.append(f"{plan_label}:\n" + retrieval_plan)
+                self._emit_progress(progress, "planning", "External retrieval forced.")
+                search_report = self._run_search_with_reflection(
+                    topic=topic,
+                    context=context,
+                    visual_report=visual_report,
+                    retrieval_plan=retrieval_plan,
+                    input_mode=input_mode,
+                    iterative_search=iterative_search,
+                    search_max_rounds=search_max_rounds,
+                    progress=progress,
+                )
+                self._record_trajectory(
+                    trajectory_run_id,
+                    stage="search",
+                    name="search_report_ready",
+                    payload={"search_report": search_report},
+                )
+            else:
+                self._emit_progress(progress, "planning", "External retrieval disabled.")
+                self._record_trajectory(
+                    trajectory_run_id,
+                    stage="planning",
+                    name="retrieval_skipped",
+                    payload={"reason": "use_search is false"},
+                )
 
             controller_report, visual_report, search_report = self._run_controller_analysis_loop(
                 topic=topic,
@@ -700,6 +716,7 @@ class MemeResearchWorkflow:
                 image_urls=image_urls,
                 max_rounds=controller_max_rounds,
                 confidence_threshold=controller_confidence_threshold,
+                allow_retrieval=use_search,
                 progress=progress,
             )
             self._record_trajectory(
@@ -979,38 +996,47 @@ class MemeResearchWorkflow:
                 )
                 self._emit_progress(progress, "vision", "Image-derived context ready.")
 
-            retrieval_plan, plan_label = self._prepare_retrieval_plan(
-                topic=topic,
-                context=context,
-                visual_report=visual_report,
-                input_mode=input_mode,
-                progress=progress,
-            )
-            self._record_trajectory(
-                trajectory_run_id,
-                stage="planning",
-                name="retrieval_plan_ready",
-                payload={"plan_label": plan_label, "retrieval_plan": retrieval_plan},
-            )
-            if retrieval_plan:
-                combined_parts.append(f"{plan_label}:\n" + retrieval_plan)
-            self._emit_progress(progress, "planning", "External retrieval forced.")
-            search_report = self._run_search_with_reflection(
-                topic=topic,
-                context=context,
-                visual_report=visual_report,
-                retrieval_plan=retrieval_plan,
-                input_mode=input_mode,
-                iterative_search=iterative_search,
-                search_max_rounds=search_max_rounds,
-                progress=progress,
-            )
-            self._record_trajectory(
-                trajectory_run_id,
-                stage="search",
-                name="search_report_ready",
-                payload={"search_report": search_report},
-            )
+            if use_search:
+                retrieval_plan, plan_label = self._prepare_retrieval_plan(
+                    topic=topic,
+                    context=context,
+                    visual_report=visual_report,
+                    input_mode=input_mode,
+                    progress=progress,
+                )
+                self._record_trajectory(
+                    trajectory_run_id,
+                    stage="planning",
+                    name="retrieval_plan_ready",
+                    payload={"plan_label": plan_label, "retrieval_plan": retrieval_plan},
+                )
+                if retrieval_plan:
+                    combined_parts.append(f"{plan_label}:\n" + retrieval_plan)
+                self._emit_progress(progress, "planning", "External retrieval forced.")
+                search_report = self._run_search_with_reflection(
+                    topic=topic,
+                    context=context,
+                    visual_report=visual_report,
+                    retrieval_plan=retrieval_plan,
+                    input_mode=input_mode,
+                    iterative_search=iterative_search,
+                    search_max_rounds=search_max_rounds,
+                    progress=progress,
+                )
+                self._record_trajectory(
+                    trajectory_run_id,
+                    stage="search",
+                    name="search_report_ready",
+                    payload={"search_report": search_report},
+                )
+            else:
+                self._emit_progress(progress, "planning", "External retrieval disabled.")
+                self._record_trajectory(
+                    trajectory_run_id,
+                    stage="planning",
+                    name="retrieval_skipped",
+                    payload={"reason": "use_search is false"},
+                )
 
             controller_report, visual_report, search_report = self._run_controller_analysis_loop(
                 topic=topic,
@@ -1022,6 +1048,7 @@ class MemeResearchWorkflow:
                 image_urls=image_urls,
                 max_rounds=controller_max_rounds,
                 confidence_threshold=controller_confidence_threshold,
+                allow_retrieval=use_search,
                 progress=progress,
             )
             self._record_trajectory(
