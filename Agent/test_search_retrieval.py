@@ -143,6 +143,69 @@ class SearchRetrievalTests(unittest.TestCase):
         self.assertEqual(reddit_type, "post_or_comment_context_candidate")
         self.assertEqual(x_type, "social_post_candidate")
 
+    def test_result_filter_keeps_specific_hits_and_drops_generic_anchor_noise(self) -> None:
+        agent = WebSearchAgent(SearchAgentConfig(cache_enabled=False))
+        profile = agent._build_relevance_profile(
+            topic="",
+            context="""
+1. OCR/text visible in the image:
+- "when you want to nap"
+- "after a long day of mudding"
+
+8. Suggested retrieval queries:
+- "nude couple in bed stock photo mudding meme"
+- "mudding meme off-road driving humor template"
+""",
+            queries=[
+                '"when you want to nap"',
+                '"after a long day of mudding"',
+                "Impact",
+                "nude couple in bed stock photo mudding",
+            ],
+        )
+
+        results = agent._dedupe_results(
+            [
+                {
+                    "title": "Are Naps Actually Good for You?",
+                    "body": "Science explained for better nap habits.",
+                    "href": "https://example.com/nap",
+                },
+                {
+                    "title": "Genshin Impact Official",
+                    "body": "Official game announcement.",
+                    "href": "https://example.com/impact",
+                },
+                {
+                    "title": "Mudding meme with nude couple in bed",
+                    "body": "Off-road mudding humor using a couple bed image.",
+                    "href": "https://example.com/mudding-meme",
+                },
+            ],
+            max_results=5,
+            relevance_terms=profile,
+        )
+
+        titles = [item["title"] for item in results]
+        self.assertEqual(["Mudding meme with nude couple in bed"], titles)
+
+    def test_result_filter_does_not_fallback_to_noise_when_relevance_terms_exist(self) -> None:
+        agent = WebSearchAgent(SearchAgentConfig(cache_enabled=False))
+
+        results = agent._dedupe_results(
+            [
+                {
+                    "title": "Unrelated sports controversy",
+                    "body": "A racing news story.",
+                    "href": "https://example.com/sports",
+                }
+            ],
+            max_results=5,
+            relevance_terms={"mudding", "couple"},
+        )
+
+        self.assertEqual([], results)
+
     def test_removed_search_providers_are_not_supported(self) -> None:
         agent = WebSearchAgent(SearchAgentConfig(cache_enabled=False))
 

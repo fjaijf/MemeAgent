@@ -40,12 +40,17 @@ POSITIVE_LABELS = {
     "true",
     "yes",
     "y",
+    "b",
     "harmful",
     "hateful",
     "offensive",
     "toxic",
     "abusive",
     "dangerous",
+    "discrimination",
+    "violence",
+    "vulgar",
+    "antagonism",
     "potentially_harmful",
     "potentially harmful",
 }
@@ -54,6 +59,7 @@ NEGATIVE_LABELS = {
     "false",
     "no",
     "n",
+    "a",
     "harmless",
     "safe",
     "benign",
@@ -65,6 +71,16 @@ NEGATIVE_LABELS = {
     "non harmful",
     "nonharmful",
 }
+UNCLEAR_LABELS = {"unclear", "unknown", "ambiguous", "无法判断", "不确定"}
+HARMFULNESS_CATEGORY_LABELS = {
+    "discrimination",
+    "offensive",
+    "violence",
+    "vulgar",
+    "antagonism",
+}
+CONVERSATION_USER_ROLES = {"user", "human"}
+CONVERSATION_ASSISTANT_ROLES = {"assistant", "gpt"}
 
 LABEL_TEST_SYSTEM_PROMPT = (
     "You are a strict binary meme safety classifier. "
@@ -138,7 +154,57 @@ def _normalize_label(value: Any) -> int | None:
         return 1
     if normalized in NEGATIVE_LABELS:
         return 0
+    text_value = str(value)
+    if re.search(r"\b(?:not|non)[-\s_]*harmful\b|\bnonharmful\b", text_value, flags=re.I):
+        return 0
+    label_matches = [
+        match.group(1).lower()
+        for match in re.finditer(r"\b(harmful|harmless)\b", text_value, flags=re.I)
+    ]
+    unique_labels = set(label_matches)
+    if unique_labels == {"harmful"}:
+        return 1
+    if unique_labels == {"harmless"}:
+        return 0
     return None
+
+
+def _conversation_text(row: dict[str, Any], roles: set[str]) -> str:
+    conversations = row.get("conversations")
+    if not isinstance(conversations, list):
+        return ""
+    for message in conversations:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("from") or message.get("role") or "").lower()
+        if role in roles:
+            value = message.get("value", message.get("content", ""))
+            if isinstance(value, str):
+                return value.strip()
+    return ""
+
+
+def _extract_tag(text: str, tag: str) -> str:
+    match = re.search(fr"<{tag}\b[^>]*>(.*?)</{tag}>", text, flags=re.I | re.S)
+    return match.group(1).strip() if match else ""
+
+
+def _extract_image_path_from_text(text: str) -> str:
+    for pattern in (
+        r"<\|vision_start\|>(.*?)<\|vision_(?:start|end)\|>",
+        r"<image>\s*([^\s<>]+)",
+        r"(/(?:data|home)/[^\s<>]+?\.(?:png|jpg|jpeg|webp|gif|bmp))",
+        r"((?:Dataset|dataset)/[^\s<>]+?\.(?:png|jpg|jpeg|webp|gif|bmp))",
+    ):
+        match = re.search(pattern, text, flags=re.I | re.S)
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
+def _label_from_conversation_answer(text: str) -> int | None:
+    judgement = _extract_tag(text, "JUDGEMENT") or text
+    return _normalize_label(judgement)
 
 
 def _read_json_dataset(path: Path) -> list[dict[str, Any]]:
@@ -179,6 +245,8 @@ def _detect_schema(rows: list[dict[str, Any]], requested_schema: str) -> str:
         keys = {str(key).lower() for key in rows[0]}
         if {"messages", "images", "solution"}.issubset(keys):
             return "label_test"
+        if "conversations" in keys:
+            return "conversation"
     return "generic"
 
 
@@ -203,16 +271,26 @@ def _resolve_image_path(raw_path: Any, dataset_path: Path, image_root: Path | No
         return Path(raw)
 
     base_root = image_root or dataset_path.parent
+    candidates: list[Path] = []
     if "/Dataset/" in raw and image_root is None:
         suffix = raw.split("/Dataset/", 1)[1]
-        candidate = dataset_path.parent / suffix
-    else:
-        candidate = Path(raw).expanduser()
-        if not candidate.is_absolute():
-            candidate = base_root / candidate
+        candidates.extend(
+            [
+                dataset_path.parent / suffix,
+                dataset_path.parent.parent / suffix,
+                Path("/data/ggbond") / "Dataset" / suffix,
+            ]
+        )
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        candidate = base_root / candidate
+    candidates.append(candidate)
 
-    if candidate.exists():
-        return candidate
+    for candidate_path in candidates:
+        if candidate_path.exists():
+            return candidate_path
+
+    candidate = candidates[0]
 
     normalized = str(candidate).replace("\\", "/")
     if "/MET/Img/" in normalized:
@@ -259,6 +337,40 @@ def _load_label_test_items(
     return items
 
 
+def _load_conversation_items(
+    rows: list[dict[str, Any]],
+    dataset_path: Path,
+    image_root: Path | None,
+) -> list[EvalItem]:
+    items: list[EvalItem] = []
+    for index, row in enumerate(rows):
+        user_text = _conversation_text(row, CONVERSATION_USER_ROLES)
+        assistant_text = _conversation_text(row, CONVERSATION_ASSISTANT_ROLES)
+        raw_image_path = row.get("image") or row.get("image_path")
+        if not raw_image_path:
+            images = row.get("images")
+            if isinstance(images, list) and images:
+                raw_image_path = images[0]
+        if not raw_image_path:
+            raw_image_path = _extract_image_path_from_text(user_text)
+        if not raw_image_path:
+            raise ValueError(
+                f"Conversation sample {row.get('id', index)} has no image path."
+            )
+
+        image_path = _resolve_image_path(raw_image_path, dataset_path, image_root)
+        items.append(
+            EvalItem(
+                sample_id=str(row.get("id") or image_path),
+                image_path=str(image_path),
+                label=_label_from_conversation_answer(assistant_text),
+                context="",
+                raw=row,
+            )
+        )
+    return items
+
+
 def load_dataset(
     dataset_path: Path,
     image_root: Path | None,
@@ -281,6 +393,8 @@ def load_dataset(
     detected_schema = _detect_schema(rows, schema)
     if detected_schema == "label_test":
         return _load_label_test_items(rows, dataset_path, image_root)
+    if detected_schema == "conversation":
+        return _load_conversation_items(rows, dataset_path, image_root)
 
     root = image_root or dataset_path.parent
     items: list[EvalItem] = []
@@ -337,20 +451,90 @@ def _prediction_binary(label: Any) -> int | None:
         return 1
     if normalized in {"potentially_harmful"}:
         return 1
-    if normalized in {"not_harmful", "unclear"}:
+    if normalized in {"not_harmful"}:
         return 0
+    if normalized in HARMFULNESS_CATEGORY_LABELS:
+        return 1
+    if normalized in UNCLEAR_LABELS:
+        return None
     return _normalize_label(normalized)
+
+
+def _first_line_value(output: str, field_name: str) -> str:
+    match = re.search(
+        rf"^\s*[-*]?\s*{re.escape(field_name)}\s*[:：]\s*(.+?)\s*$",
+        output,
+        flags=re.I | re.M,
+    )
+    return match.group(1).strip() if match else ""
+
+
+def _prediction_binary_from_labels(labels: str) -> int | None:
+    if not labels:
+        return None
+    parts = [
+        part.strip().lower().replace("-", "_")
+        for part in re.split(r"[,;/|，、]|\band\b", labels)
+        if part.strip()
+    ]
+    if any(part in HARMFULNESS_CATEGORY_LABELS for part in parts):
+        return 1
+    if any(part in {"not_harmful", "harmless"} for part in parts):
+        return 0
+    if any(part in UNCLEAR_LABELS for part in parts):
+        return None
+    return _prediction_binary(labels)
+
+
+def _prediction_binary_from_decision(decision: str, labels: str = "") -> int | None:
+    normalized = decision.strip().lower().replace("-", "_")
+    if normalized in {"harmful"}:
+        return 1
+    if normalized in {"not_harmful", "harmless"}:
+        return 0
+    if normalized in UNCLEAR_LABELS:
+        return None
+    return _prediction_binary_from_labels(labels)
 
 
 def _prediction_from_text(output: str) -> Prediction:
     parsed = _extract_json_object(output)
-    label = str(parsed.get("harmfulness_label") or parsed.get("label") or "").strip()
+    final_decision = str(parsed.get("final_decision") or parsed.get("decision") or "").strip()
+    decision_is_unclear = (
+        final_decision.strip().lower().replace("-", "_") in UNCLEAR_LABELS
+    )
+    label = str(
+        parsed.get("harmfulness_label")
+        or parsed.get("harmfulness_labels")
+        or parsed.get("label")
+        or final_decision
+        or ""
+    ).strip()
     confidence = str(parsed.get("confidence") or "unknown").strip()
     rationale = str(parsed.get("rationale") or parsed.get("reason") or "").strip()
+    binary = _prediction_binary_from_decision(final_decision, label)
+
+    if binary is None:
+        text_decision = _first_line_value(output, "final_decision")
+        text_labels = _first_line_value(output, "harmfulness_labels")
+        if text_decision or text_labels:
+            final_decision = text_decision or final_decision
+            decision_is_unclear = (
+                final_decision.strip().lower().replace("-", "_") in UNCLEAR_LABELS
+            )
+            label = text_labels or text_decision or label
+            binary = _prediction_binary_from_decision(text_decision, text_labels)
+            if confidence == "unknown":
+                confidence_value = _first_line_value(output, "confidence")
+                if confidence_value:
+                    confidence = confidence_value
+            if not rationale:
+                rationale = _first_line_value(output, "summary")
 
     boxed = re.search(r"\\boxed\{\s*([AB])\s*\}", output, flags=re.I)
     if boxed:
         label = boxed.group(1).upper()
+        binary = _prediction_binary(label)
 
     if not label:
         match = re.search(
@@ -360,22 +544,32 @@ def _prediction_from_text(output: str) -> Prediction:
         )
         if match:
             label = match.group(1).strip().split()[0]
+            binary = _prediction_binary(label)
 
     if not label:
         stripped = output.strip()
         if re.fullmatch(r"[AB]", stripped, flags=re.I):
             label = stripped.upper()
+            binary = _prediction_binary(label)
 
     if not label:
         compact = output.strip().lower().replace("-", "_")
         if "nonharmful" in compact or "non_harmful" in compact or "harmless" in compact:
             label = "nonharmful"
+            binary = 0
         elif "harmful" in compact:
             label = "harmful"
+            binary = 1
 
     return Prediction(
         label=label or "unknown",
-        binary=_prediction_binary(label),
+        binary=(
+            binary
+            if binary is not None
+            else None
+            if decision_is_unclear
+            else _prediction_binary(label)
+        ),
         confidence=confidence,
         rationale=rationale,
         raw_output=output,
@@ -444,12 +638,14 @@ def make_workflow(
                 search_api_key=config.search_api_key,
                 tavily_api_key=config.tavily_api_key,
                 zhihu_api_key=config.zhihu_api_key,
+                anspire_api_key=config.anspire_api_key,
                 glm_search_api_key=config.glm_search_api_key,
                 glm_search_engine=config.glm_search_engine,
                 glm_search_recency_filter=config.glm_search_recency_filter,
                 glm_search_content_size=config.glm_search_content_size,
                 glm_search_domain_filter=config.glm_search_domain_filter,
                 search_proxy=config.search_proxy,
+                context_proxy=config.context_proxy,
                 search_max_results=config.search_max_results,
                 news_max_results=config.news_max_results,
                 search_timeout=config.search_timeout,
@@ -472,12 +668,26 @@ def make_workflow(
 def predict_workflow(
     workflow: MemeResearchWorkflow,
     item: EvalItem,
+    *,
+    task_heads: list[str],
+    use_search: bool,
+    force_search: bool,
+    iterative_search: bool,
+    search_max_rounds: int,
+    controller_max_rounds: int,
+    controller_confidence_threshold: float,
 ) -> Prediction:
     result = workflow.run_heads(
         topic=item.sample_id,
         context=item.context,
         image_paths=[item.image_path],
-        task_heads=["harmfulness"],
+        task_heads=task_heads,
+        use_search=use_search,
+        force_search=force_search,
+        iterative_search=iterative_search,
+        search_max_rounds=search_max_rounds,
+        controller_max_rounds=controller_max_rounds,
+        controller_confidence_threshold=controller_confidence_threshold,
         progress=None,
     )
     return _prediction_from_text(result.formatted_output)
@@ -593,9 +803,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=["direct", "workflow"], default="direct")
     parser.add_argument(
         "--schema",
-        choices=["auto", "label_test", "generic"],
+        choices=["auto", "label_test", "generic", "conversation"],
         default="auto",
-        help="Dataset schema. auto detects messages/images/solution label_test format.",
+        help=(
+            "Dataset schema. auto detects messages/images/solution label_test format "
+            "or conversations-style CoT format."
+        ),
     )
     parser.add_argument("--id-field", default=None)
     parser.add_argument("--image-field", default=None)
@@ -608,12 +821,49 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--search",
         action="store_true",
-        help="Compatibility flag; retrieval is always enabled in workflow mode.",
+        help="Enable external retrieval in workflow mode.",
+    )
+    parser.add_argument(
+        "--no-search",
+        action="store_true",
+        help="Disable external retrieval in workflow mode, matching main.py --no-search.",
     )
     parser.add_argument(
         "--force-search",
         action="store_true",
-        help="Compatibility flag; retrieval is always forced in workflow mode.",
+        help="Force external retrieval planning when workflow search is enabled.",
+    )
+    parser.add_argument(
+        "--task",
+        action="append",
+        default=None,
+        help=(
+            "Workflow task head(s), matching main.py --task. Defaults to harmfulness. "
+            "Can be passed multiple times or comma-separated."
+        ),
+    )
+    parser.add_argument(
+        "--iterative-search",
+        action="store_true",
+        help="Use LLM reflection to run multiple retrieval rounds in workflow mode.",
+    )
+    parser.add_argument(
+        "--search-max-rounds",
+        type=int,
+        default=5,
+        help="Maximum retrieval rounds when --iterative-search is enabled.",
+    )
+    parser.add_argument(
+        "--controller-max-rounds",
+        type=int,
+        default=3,
+        help="Maximum controller-planned analysis rounds in workflow mode.",
+    )
+    parser.add_argument(
+        "--controller-confidence-threshold",
+        type=float,
+        default=0.8,
+        help="Controller confidence threshold in workflow mode.",
     )
     parser.add_argument("--disable-memory", action="store_true", help="Do not read/write local memory.")
     parser.add_argument(
@@ -670,6 +920,12 @@ def main() -> int:
     summary_path.parent.mkdir(parents=True, exist_ok=True)
 
     config = MemeAgentConfig.from_env()
+    workflow_use_search = config.search_enabled
+    if args.search:
+        workflow_use_search = True
+    if args.no_search:
+        workflow_use_search = False
+    task_heads = args.task or ["harmfulness"]
     workflow = None
     if args.mode == "workflow":
         workflow = make_workflow(
@@ -720,6 +976,13 @@ def main() -> int:
                     prediction = predict_workflow(
                         workflow,
                         item,
+                        task_heads=task_heads,
+                        use_search=workflow_use_search,
+                        force_search=args.force_search,
+                        iterative_search=args.iterative_search,
+                        search_max_rounds=args.search_max_rounds,
+                        controller_max_rounds=args.controller_max_rounds,
+                        controller_confidence_threshold=args.controller_confidence_threshold,
                     )
                 else:
                     prediction = predict_direct(_thread_direct_agent(config), item)
@@ -800,6 +1063,17 @@ def main() -> int:
         "dataset": str(dataset_path),
         "mode": args.mode,
         "schema": args.schema,
+        "task_heads": task_heads if args.mode == "workflow" else [],
+        "search_enabled": workflow_use_search if args.mode == "workflow" else None,
+        "force_search": args.force_search if args.mode == "workflow" else None,
+        "iterative_search": args.iterative_search if args.mode == "workflow" else None,
+        "search_max_rounds": args.search_max_rounds if args.mode == "workflow" else None,
+        "controller_max_rounds": (
+            args.controller_max_rounds if args.mode == "workflow" else None
+        ),
+        "controller_confidence_threshold": (
+            args.controller_confidence_threshold if args.mode == "workflow" else None
+        ),
         "total_loaded": len(items),
         "processed_this_run": processed,
         "elapsed_seconds": round(time.time() - started_at, 3),

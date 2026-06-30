@@ -110,8 +110,9 @@ pip install -e ".[local]"
 pip install -r requirements-local.txt
 ```
 
-To keep both local models loaded as a long-running OpenAI-compatible service,
-configure service model names and paths:
+To keep both local models loaded as long-running OpenAI-compatible services,
+use the vLLM-backed local router. The router listens on one MemeAgent endpoint
+and forwards each model name to its own vLLM backend:
 
 ```bash
 MEMEAGENT_PROVIDER=openai-compatible
@@ -126,6 +127,12 @@ MEMEAGENT_SERVICE_MAIN_MODEL=memeagent-main
 MEMEAGENT_SERVICE_MAIN_MODEL_PATH=/data/ggbond/Qwen3.6-27B
 MEMEAGENT_SERVICE_CONTROLLER_MODEL=memeagent-controller
 MEMEAGENT_SERVICE_CONTROLLER_MODEL_PATH=/data/ggbond/Qwen3-32B
+
+MEMEAGENT_SERVICE_HOST=127.0.0.1
+MEMEAGENT_SERVICE_PORT=8008
+MEMEAGENT_VLLM_MAIN_PORT=8009
+MEMEAGENT_VLLM_CONTROLLER_PORT=8010
+MEMEAGENT_VLLM_ENABLE_PREFIX_CACHING=true
 ```
 
 Start the service once, then run `main.py` in separate commands:
@@ -135,9 +142,34 @@ python local_inference_server.py
 python main.py --topic "PEPE"
 ```
 
-The service process owns the loaded model weights and GPU memory. `main.py`
-calls the service through `/v1/chat/completions` instead of loading weights
-inside the CLI process.
+The router starts two `vllm serve` processes by default: one for
+`memeagent-main` and one for `memeagent-controller`. `main.py` calls the router
+through `/v1/chat/completions`; the router preserves the existing model names
+while vLLM handles batching, prefix caching, paged attention, and GPU memory
+management.
+
+Useful vLLM tuning variables:
+
+```bash
+MEMEAGENT_VLLM_MAIN_CUDA_VISIBLE_DEVICES=0
+MEMEAGENT_VLLM_CONTROLLER_CUDA_VISIBLE_DEVICES=1
+MEMEAGENT_VLLM_TENSOR_PARALLEL_SIZE=1
+MEMEAGENT_VLLM_GPU_MEMORY_UTILIZATION=0.90
+MEMEAGENT_VLLM_MAX_MODEL_LEN=32768
+MEMEAGENT_VLLM_MAX_NUM_SEQS=8
+MEMEAGENT_VLLM_LIMIT_MM_PER_PROMPT='{"image": 4}'
+```
+
+If you prefer to start vLLM yourself, point the router at existing backends:
+
+```bash
+vllm serve /data/ggbond/Qwen3.6-27B --served-model-name memeagent-main --port 8009 --trust-remote-code --enable-prefix-caching
+vllm serve /data/ggbond/Qwen3-32B --served-model-name memeagent-controller --port 8010 --trust-remote-code --enable-prefix-caching
+
+MEMEAGENT_VLLM_MAIN_BACKEND_URL=http://127.0.0.1:8009/v1
+MEMEAGENT_VLLM_CONTROLLER_BACKEND_URL=http://127.0.0.1:8010/v1
+python local_inference_server.py --no-spawn
+```
 
 MemeAgent runs public web/news retrieval before analysis by default:
 

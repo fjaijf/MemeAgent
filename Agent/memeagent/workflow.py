@@ -245,6 +245,126 @@ class MemeResearchWorkflow:
     ) -> bool:
         return self._controller_confidence(controller_plan) >= confidence_threshold
 
+    def _extract_controller_section(self, controller_plan: str, section: str) -> str:
+        pattern = re.compile(
+            rf"(?ims)^\s*{re.escape(section)}\s*:\s*\n"
+            rf"(?P<body>.*?)(?=^\s*[A-Z][A-Z0-9_ ]{{2,}}\s*:\s*$|\Z)"
+        )
+        match = pattern.search(controller_plan)
+        if match:
+            return match.group("body").strip()
+        inline = re.search(rf"(?im)^\s*{re.escape(section)}\s*:\s*(.+)$", controller_plan)
+        return inline.group(1).strip() if inline else ""
+
+    def _normalize_controller_text(self, value: str) -> str:
+        normalized = value.lower()
+        normalized = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", normalized, flags=re.M)
+        normalized = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", " ", normalized)
+        return " ".join(normalized.split())
+
+    def _is_repeated_controller_request(
+        self,
+        normalized_request: str,
+        prior_request_fingerprints: set[str],
+    ) -> bool:
+        request_terms = set(normalized_request.split())
+        if not request_terms:
+            return True
+        for prior_request in prior_request_fingerprints:
+            prior_terms = set(prior_request.split())
+            if not prior_terms:
+                continue
+            overlap = len(request_terms & prior_terms) / max(
+                1,
+                min(len(request_terms), len(prior_terms)),
+            )
+            if overlap >= 0.75:
+                return True
+        return False
+
+    def _has_new_image_answerable_requests(
+        self,
+        controller_plan: str,
+        prior_request_fingerprints: set[str],
+    ) -> bool:
+        request_text = "\n".join(
+            part
+            for part in (
+                self._extract_controller_section(controller_plan, "FOCUS_QUESTIONS"),
+                self._extract_controller_section(
+                    controller_plan,
+                    "MULTIMODAL_ANALYSIS_REQUESTS",
+                ),
+            )
+            if part
+        )
+        normalized = self._normalize_controller_text(request_text)
+        if not normalized or normalized in {"none", "无", "没有"}:
+            return False
+
+        external_only_terms = (
+            "source",
+            "origin",
+            "platform",
+            "reddit",
+            "twitter",
+            "x com",
+            "tiktok",
+            "template lineage",
+            "prior iteration",
+            "prior iterations",
+            "known meme",
+            "stock photo database",
+            "web",
+            "search",
+            "external",
+            "documented",
+            "document",
+            "来源",
+            "平台",
+            "检索",
+            "搜索",
+            "外部",
+            "出处",
+            "源头",
+            "模板谱系",
+        )
+        image_terms = (
+            "image",
+            "visual",
+            "ocr",
+            "text",
+            "layout",
+            "watermark",
+            "ui",
+            "logo",
+            "symbol",
+            "visible",
+            "pixel",
+            "pose",
+            "framing",
+            "gesture",
+            "color",
+            "图像",
+            "视觉",
+            "文字",
+            "水印",
+            "可见",
+            "姿势",
+            "构图",
+            "符号",
+        )
+        has_image_terms = any(term in normalized for term in image_terms)
+        has_external_terms = any(term in normalized for term in external_only_terms)
+        if has_external_terms and not has_image_terms:
+            return False
+
+        fingerprint = normalized[:500]
+        if self._is_repeated_controller_request(fingerprint, prior_request_fingerprints):
+            return False
+        prior_request_fingerprints.add(fingerprint)
+        return True
+
     def _prepare_retrieval_plan(
         self,
         topic: str,
@@ -280,6 +400,7 @@ class MemeResearchWorkflow:
         round_index: int,
         max_rounds: int,
         confidence_threshold: float,
+        retrieval_enabled: bool,
         progress: Callable[[str, str], None] | None,
     ) -> str:
         self._emit_progress(
@@ -298,6 +419,7 @@ class MemeResearchWorkflow:
                 round_index=round_index,
                 max_rounds=max_rounds,
                 confidence_threshold=confidence_threshold,
+                retrieval_enabled=retrieval_enabled,
             )
         except Exception as exc:
             raise RuntimeError("Controller analysis planning LLM call failed.") from exc
@@ -346,6 +468,7 @@ class MemeResearchWorkflow:
         round_blocks: list[str] = []
         cumulative_visual_report = visual_report
         cumulative_search_report = search_report
+        prior_no_search_request_fingerprints: set[str] = set()
 
         for round_index in range(1, max_rounds + 1):
             iteration_history = "\n\n".join(round_blocks)
@@ -359,6 +482,7 @@ class MemeResearchWorkflow:
                 round_index=round_index,
                 max_rounds=max_rounds,
                 confidence_threshold=confidence_threshold,
+                retrieval_enabled=allow_retrieval,
                 progress=progress,
             )
             confidence = self._controller_confidence(controller_plan)
@@ -388,6 +512,25 @@ class MemeResearchWorkflow:
                     progress,
                     "controller",
                     f"Max controller rounds reached with confidence {confidence:.2f}.",
+                )
+                break
+
+            if not allow_retrieval and not self._has_new_image_answerable_requests(
+                controller_plan,
+                prior_no_search_request_fingerprints,
+            ):
+                self._emit_progress(
+                    progress,
+                    "controller",
+                    (
+                        "No new image-answerable controller questions remain; "
+                        "continuing with offline evidence."
+                    ),
+                )
+                round_blocks.append(
+                    "## No-Search Controller Stop\n\n"
+                    "External retrieval is disabled and the remaining gaps are "
+                    "not answerable by re-inspecting the current image."
                 )
                 break
 

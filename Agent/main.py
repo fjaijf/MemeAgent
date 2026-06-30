@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import replace
+from datetime import datetime
+import os
 from pathlib import Path
 
 from memeagent.agent import MemeAgent
@@ -9,6 +11,7 @@ from memeagent.cli_ui import MemeAgentCLI, RunSummary
 from memeagent.config import MemeAgentConfig, load_project_env
 from memeagent.heads import HEADS
 from memeagent.llm import create_controller_llm, create_llm
+from memeagent.llm_trace import LLMTraceRecorder, TracedLLM
 from memeagent.memory import MemeMemoryStore
 from memeagent.search_agent import SearchAgentConfig, WebSearchAgent
 from memeagent.trajectory import MemeTrajectoryCache
@@ -209,6 +212,16 @@ def parse_args() -> argparse.Namespace:
         help="Show a live workflow trace while running, then clear it before final output.",
     )
     parser.add_argument(
+        "--llm-trace-json",
+        nargs="?",
+        const="auto",
+        default=None,
+        help=(
+            "Record visible LLM prompts/outputs for this run to a structured JSON file. "
+            "Pass without a path to write under .memeagent_traces."
+        ),
+    )
+    parser.add_argument(
         "--task",
         action="append",
         default=[],
@@ -224,6 +237,27 @@ def parse_args() -> argparse.Namespace:
         help="List available multi-head task names and exit.",
     )
     return parser.parse_args()
+
+
+def _resolve_llm_trace_path(
+    value: str | None,
+    *,
+    project_root: Path,
+) -> Path | None:
+    trace_value = value
+    if trace_value is None:
+        trace_value = os.getenv("MEMEAGENT_LLM_TRACE_JSON", "").strip() or None
+    if trace_value is None:
+        return None
+
+    if trace_value == "auto" or trace_value.lower() in {"1", "true", "yes", "on"}:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return project_root / ".memeagent_traces" / f"llm_trace_{timestamp}.json"
+
+    trace_path = Path(trace_value).expanduser()
+    if not trace_path.is_absolute():
+        trace_path = project_root / trace_path
+    return trace_path
 
 
 def main() -> None:
@@ -312,9 +346,36 @@ def main() -> None:
         if config.memory_enabled
         else None
     )
+    llm_trace_path = _resolve_llm_trace_path(args.llm_trace_json, project_root=project_root)
+    llm_trace_recorder = (
+        LLMTraceRecorder(
+            llm_trace_path,
+            metadata={
+                "topic": args.topic,
+                "image_count": len(args.image) + len(args.image_url),
+                "search_enabled": search_requested,
+                "iterative_search": args.iterative_search,
+                "controller_max_rounds": args.controller_max_rounds,
+                "controller_confidence_threshold": args.controller_confidence_threshold,
+                "task_heads": args.task,
+                "primary_model": config.model,
+                "controller_model": config.controller_model,
+            },
+        )
+        if llm_trace_path is not None
+        else None
+    )
     llm = create_llm(config)
+    if llm_trace_recorder is not None:
+        llm = TracedLLM(llm, recorder=llm_trace_recorder, name="primary")
     agent = MemeAgent(llm=llm, system_prompt=config.system_prompt)
     controller_llm = create_controller_llm(config)
+    if controller_llm is not None and llm_trace_recorder is not None:
+        controller_llm = TracedLLM(
+            controller_llm,
+            recorder=llm_trace_recorder,
+            name="controller",
+        )
     controller_agent = (
         MemeAgent(llm=controller_llm, system_prompt=config.system_prompt)
         if controller_llm is not None
@@ -439,6 +500,8 @@ def main() -> None:
                 show_search=search_requested and args.show_search and not search_shown,
                 analysis_title="Task Heads",
             )
+            if llm_trace_path is not None:
+                print(f"\nLLM trace JSON: {llm_trace_path}")
             return
 
         result = workflow.run(
@@ -480,6 +543,8 @@ def main() -> None:
                 controller_report=result.controller_report,
                 show_search=search_requested and args.show_search and not search_shown,
             )
+        if llm_trace_path is not None:
+            print(f"\nLLM trace JSON: {llm_trace_path}")
     except KeyboardInterrupt:
         ui.stop_activity()
         ui.print_error("\nInterrupted by user.")

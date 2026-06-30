@@ -142,6 +142,41 @@ FINAL_OUTPUT_NOTES:
         return "Follow-up image analysis confirms OCR and harm cues."
 
 
+class RepeatedExternalGapNoSearchMemeAgent(LowThenHighControllerMemeAgent):
+    def plan_analysis_iteration(self, **_: object) -> str:
+        self.controller_calls += 1
+        return """
+ITERATION_CONFIDENCE:
+- 0.40
+
+SHOULD_FINALIZE:
+- no
+
+CONFIDENCE_REASON:
+- Need source, platform, and template lineage evidence.
+
+KEY_FINDINGS_SO_FAR:
+- Visual evidence is available, but external origin context is missing.
+
+FOCUS_QUESTIONS:
+- What platform did this meme come from?
+- Is this a known meme template lineage?
+- Can the source page or original post be found?
+
+MULTIMODAL_ANALYSIS_REQUESTS:
+- None
+
+SUPPLEMENTAL_WEB_QUERIES:
+- exact phrase source
+
+SUPPLEMENTAL_NEWS_QUERIES:
+- None
+
+FINAL_OUTPUT_NOTES:
+- Treat external source and lineage as unresolved because search is disabled.
+""".strip()
+
+
 class HighConfidenceNoFinalizeMemeAgent(FakeMemeAgent):
     def plan_analysis_iteration(self, **_: object) -> str:
         self.controller_calls += 1
@@ -270,6 +305,25 @@ class ForcedRetrievalWorkflowTests(unittest.TestCase):
         self.assertIn("Follow-up image analysis confirms OCR", result.visual_report)
         self.assertEqual("", result.search_report)
         self.assertNotIn("Controller-Directed Retrieval Round 2", result.controller_report)
+
+    def test_no_search_stops_when_remaining_controller_gaps_are_external_only(self) -> None:
+        meme_agent = RepeatedExternalGapNoSearchMemeAgent()
+        search_agent = FakeSearchAgent()
+        workflow = MemeResearchWorkflow(meme_agent=meme_agent, search_agent=search_agent)
+
+        result = workflow.run(
+            topic="image meme",
+            image_paths=["test.png"],
+            use_search=False,
+            controller_max_rounds=3,
+            controller_confidence_threshold=0.8,
+        )
+
+        self.assertEqual(1, meme_agent.controller_calls)
+        self.assertEqual(0, meme_agent.image_followups)
+        self.assertEqual(0, search_agent.calls)
+        self.assertIn("No-Search Controller Stop", result.controller_report)
+        self.assertEqual("", result.search_report)
 
     def test_controller_stops_when_confidence_reaches_threshold(self) -> None:
         meme_agent = HighConfidenceNoFinalizeMemeAgent()

@@ -180,6 +180,7 @@ QUERY_CAUTIONS:
         round_index: int = 1,
         max_rounds: int = 3,
         confidence_threshold: float = 0.8,
+        retrieval_enabled: bool = True,
     ) -> str:
         user_prompt = f"""
 Topic hint: {topic or "None"}
@@ -188,6 +189,7 @@ Input mode: {input_mode}
 
 Current controller round: {round_index} of {max_rounds}
 Finalization threshold: {confidence_threshold:.2f}
+External retrieval enabled: {"yes" if retrieval_enabled else "no"}
 
 Project rubric:
 {MEME_ANALYSIS_RUBRIC}
@@ -219,6 +221,18 @@ Rules:
 - Ask for retrieval when source event, template, platform context, audience boundary, or evolution lineage needs external evidence.
 - Do not invent entities, events, platforms, dates, or source IDs.
 - The confidence score must reflect evidence sufficiency, not how plausible your current guess feels.
+- When external retrieval is disabled, do not keep asking for source, platform,
+  origin, lineage, or web-confirmation evidence that cannot be obtained from
+  the current image/user context. Put those unresolved external gaps in
+  FINAL_OUTPUT_NOTES instead.
+- When external retrieval is disabled, only ask follow-up multimodal questions
+  that can be answered by re-inspecting pixels, OCR, layout, symbols, visible UI,
+  watermarks, or visual ambiguity. Do not repeat focus questions already answered
+  in Previous controller and multimodal iteration history.
+- When external retrieval is disabled and no new image-answerable question
+  remains, set SHOULD_FINALIZE to yes, set multimodal/retrieval requests to
+  None, and make the confidence score reflect best available offline certainty
+  rather than missing web evidence.
 
 {CONTROLLER_OUTPUT_SCHEMA}
 """.strip()

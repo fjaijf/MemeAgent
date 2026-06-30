@@ -1,49 +1,57 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import os
 from pathlib import Path
-from types import SimpleNamespace
+import shlex
+import subprocess
+import sys
 import time
-from threading import Lock
-from typing import Any
-import uuid
+from typing import Any, Iterator
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
-from langchain_core.messages import HumanMessage, SystemMessage
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+import requests
 
 from memeagent.config import MemeAgentConfig, load_project_env
-from memeagent.llm import ChatResponse, LocalTransformersChatClient
 
 
-_LOCAL_PROVIDERS = {"local", "local-transformers", "transformers", "hf", "huggingface"}
+@dataclass(frozen=True)
+class VLLMModelSettings:
+    name: str
+    model_path: str
+    host: str
+    port: int
+    backend_url: str
+    tensor_parallel_size: int | None
+    gpu_memory_utilization: float | None
+    max_model_len: int | None
+    max_num_seqs: int | None
+    max_num_batched_tokens: int | None
+    dtype: str | None
+    quantization: str | None
+    limit_mm_per_prompt: str | None
+    cuda_visible_devices: str | None
+    extra_args: tuple[str, ...]
 
 
 @dataclass(frozen=True)
 class ServerSettings:
-    main_model: str
-    main_model_path: str
-    controller_model: str
-    controller_model_path: str
+    main: VLLMModelSettings
+    controller: VLLMModelSettings
     host: str
     port: int
-    temperature: float
-    max_tokens: int | None
-    timeout: float
-    controller_temperature: float
-    controller_max_tokens: int | None
-    controller_timeout: float
-    controller_thinking_enabled: bool
-
-
-@dataclass
-class ModelRuntime:
-    name: str
-    client: LocalTransformersChatClient
-    lock: Lock
+    command: str
+    spawn_vllm: bool
+    startup_timeout_seconds: float
+    startup_poll_seconds: float
+    trust_remote_code: bool
+    enable_prefix_caching: bool
+    api_key: str | None
+    backend_api_key: str | None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -55,24 +63,178 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
 
 
+class ManagedVLLMProcess:
+    def __init__(self, settings: VLLMModelSettings, server: ServerSettings) -> None:
+        self.settings = settings
+        self.server = server
+        self.process: subprocess.Popen[str] | None = None
+
+    def command(self) -> list[str]:
+        cmd = [
+            self.server.command,
+            "serve",
+            self.settings.model_path,
+            "--host",
+            self.settings.host,
+            "--port",
+            str(self.settings.port),
+            "--served-model-name",
+            self.settings.name,
+        ]
+        if self.server.trust_remote_code:
+            cmd.append("--trust-remote-code")
+        if self.server.enable_prefix_caching:
+            cmd.append("--enable-prefix-caching")
+        if self.server.backend_api_key:
+            cmd.extend(["--api-key", self.server.backend_api_key])
+        if self.settings.tensor_parallel_size is not None:
+            cmd.extend(["--tensor-parallel-size", str(self.settings.tensor_parallel_size)])
+        if self.settings.gpu_memory_utilization is not None:
+            cmd.extend(
+                ["--gpu-memory-utilization", str(self.settings.gpu_memory_utilization)]
+            )
+        if self.settings.max_model_len is not None:
+            cmd.extend(["--max-model-len", str(self.settings.max_model_len)])
+        if self.settings.max_num_seqs is not None:
+            cmd.extend(["--max-num-seqs", str(self.settings.max_num_seqs)])
+        if self.settings.max_num_batched_tokens is not None:
+            cmd.extend(
+                ["--max-num-batched-tokens", str(self.settings.max_num_batched_tokens)]
+            )
+        if self.settings.dtype:
+            cmd.extend(["--dtype", self.settings.dtype])
+        if self.settings.quantization:
+            cmd.extend(["--quantization", self.settings.quantization])
+        if self.settings.limit_mm_per_prompt:
+            cmd.extend(["--limit-mm-per-prompt", self.settings.limit_mm_per_prompt])
+        cmd.extend(self.settings.extra_args)
+        return cmd
+
+    def start(self) -> None:
+        env = os.environ.copy()
+        if self.settings.cuda_visible_devices:
+            env["CUDA_VISIBLE_DEVICES"] = self.settings.cuda_visible_devices
+        cmd = self.command()
+        print(f"[vLLM:{self.settings.name}] starting: {' '.join(shlex.quote(x) for x in cmd)}")
+        self.process = subprocess.Popen(
+            cmd,
+            env=env,
+            text=True,
+        )
+
+    def stop(self) -> None:
+        if self.process is None or self.process.poll() is not None:
+            return
+        print(f"[vLLM:{self.settings.name}] stopping pid={self.process.pid}", flush=True)
+        self.process.terminate()
+        try:
+            self.process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait(timeout=10)
+
+    def assert_running(self) -> None:
+        if self.process is not None and self.process.poll() is not None:
+            raise RuntimeError(
+                f"vLLM process for {self.settings.name!r} exited with code "
+                f"{self.process.returncode}."
+            )
+
+
 def _env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip().strip('"').strip("'")
 
 
-def _resolve_model_path(
-    *,
-    env_name: str,
-    provider: str | None,
-    configured_model: str,
-    label: str,
-) -> str:
+def _env_bool(name: str, default: bool) -> bool:
+    value = _env(name)
+    if not value:
+        return default
+    return value.lower() not in {"0", "false", "no", "off", "disabled"}
+
+
+def _env_int(name: str, default: int | None = None) -> int | None:
+    value = _env(name)
+    return int(value) if value else default
+
+
+def _env_float(name: str, default: float | None = None) -> float | None:
+    value = _env(name)
+    return float(value) if value else default
+
+
+def _split_extra_args(value: str) -> tuple[str, ...]:
+    return tuple(shlex.split(value)) if value else ()
+
+
+def _first_env(names: tuple[str, ...], default: str = "") -> str:
+    for name in names:
+        value = _env(name)
+        if value:
+            return value
+    return default
+
+
+def _resolve_model_path(env_name: str, configured_model: str) -> str:
     value = _env(env_name)
-    if value:
-        return value
-    if provider in _LOCAL_PROVIDERS:
-        return configured_model
-    raise RuntimeError(
-        f"{env_name} is required because {label} is configured as an API/client model."
+    return value or configured_model
+
+
+def _backend_base_url(host: str, port: int) -> str:
+    return f"http://{host}:{port}/v1"
+
+
+def _model_settings(
+    *,
+    role: str,
+    name: str,
+    model_path: str,
+    host: str,
+    port: int,
+) -> VLLMModelSettings:
+    prefix = f"MEMEAGENT_VLLM_{role.upper()}_"
+    common_prefix = "MEMEAGENT_VLLM_"
+    resolved_host = _first_env((prefix + "HOST",), host)
+    resolved_port = _env_int(prefix + "PORT", port) or port
+    backend_url = _first_env(
+        (prefix + "BACKEND_URL",),
+        _backend_base_url(resolved_host, resolved_port),
+    )
+    return VLLMModelSettings(
+        name=name,
+        model_path=model_path,
+        host=resolved_host,
+        port=resolved_port,
+        backend_url=backend_url.rstrip("/"),
+        tensor_parallel_size=_env_int(
+            prefix + "TENSOR_PARALLEL_SIZE",
+            _env_int(common_prefix + "TENSOR_PARALLEL_SIZE"),
+        ),
+        gpu_memory_utilization=_env_float(
+            prefix + "GPU_MEMORY_UTILIZATION",
+            _env_float(common_prefix + "GPU_MEMORY_UTILIZATION"),
+        ),
+        max_model_len=_env_int(
+            prefix + "MAX_MODEL_LEN",
+            _env_int(common_prefix + "MAX_MODEL_LEN"),
+        ),
+        max_num_seqs=_env_int(
+            prefix + "MAX_NUM_SEQS",
+            _env_int(common_prefix + "MAX_NUM_SEQS"),
+        ),
+        max_num_batched_tokens=_env_int(
+            prefix + "MAX_NUM_BATCHED_TOKENS",
+            _env_int(common_prefix + "MAX_NUM_BATCHED_TOKENS"),
+        ),
+        dtype=_first_env((prefix + "DTYPE", common_prefix + "DTYPE"), "auto") or None,
+        quantization=_first_env((prefix + "QUANTIZATION", common_prefix + "QUANTIZATION")),
+        limit_mm_per_prompt=_first_env(
+            (prefix + "LIMIT_MM_PER_PROMPT", common_prefix + "LIMIT_MM_PER_PROMPT")
+        ),
+        cuda_visible_devices=_first_env((prefix + "CUDA_VISIBLE_DEVICES",)),
+        extra_args=(
+            _split_extra_args(_env(common_prefix + "EXTRA_ARGS"))
+            + _split_extra_args(_env(prefix + "EXTRA_ARGS"))
+        ),
     )
 
 
@@ -84,251 +246,282 @@ def _build_settings(project_root: Path) -> ServerSettings:
         "MEMEAGENT_SERVICE_CONTROLLER_MODEL",
         config.controller_model or "memeagent-controller",
     )
+    service_host = _env("MEMEAGENT_SERVICE_HOST", "127.0.0.1")
+    service_port = int(_env("MEMEAGENT_SERVICE_PORT", "8008"))
+    vllm_host = _env("MEMEAGENT_VLLM_HOST", "127.0.0.1")
+    main_port = int(_env("MEMEAGENT_VLLM_MAIN_PORT", "8009"))
+    controller_port = int(_env("MEMEAGENT_VLLM_CONTROLLER_PORT", "8010"))
     return ServerSettings(
-        main_model=main_model,
-        main_model_path=_resolve_model_path(
-            env_name="MEMEAGENT_SERVICE_MAIN_MODEL_PATH",
-            provider=config.provider,
-            configured_model=config.model,
-            label="main model",
+        main=_model_settings(
+            role="main",
+            name=main_model,
+            model_path=_resolve_model_path(
+                "MEMEAGENT_SERVICE_MAIN_MODEL_PATH",
+                config.model,
+            ),
+            host=vllm_host,
+            port=main_port,
         ),
-        controller_model=controller_model,
-        controller_model_path=_resolve_model_path(
-            env_name="MEMEAGENT_SERVICE_CONTROLLER_MODEL_PATH",
-            provider=config.controller_provider,
-            configured_model=config.controller_model,
-            label="controller model",
+        controller=_model_settings(
+            role="controller",
+            name=controller_model,
+            model_path=_resolve_model_path(
+                "MEMEAGENT_SERVICE_CONTROLLER_MODEL_PATH",
+                config.controller_model,
+            ),
+            host=vllm_host,
+            port=controller_port,
         ),
-        host=_env("MEMEAGENT_SERVICE_HOST", "127.0.0.1"),
-        port=int(_env("MEMEAGENT_SERVICE_PORT", "8008")),
-        temperature=config.temperature,
-        max_tokens=config.max_tokens,
-        timeout=config.timeout,
-        controller_temperature=config.controller_temperature,
-        controller_max_tokens=config.controller_max_tokens,
-        controller_timeout=config.controller_timeout,
-        controller_thinking_enabled=config.controller_thinking_enabled,
+        host=service_host,
+        port=service_port,
+        command=_env("MEMEAGENT_VLLM_COMMAND", "vllm"),
+        spawn_vllm=_env_bool("MEMEAGENT_VLLM_SPAWN", True),
+        startup_timeout_seconds=float(_env("MEMEAGENT_VLLM_STARTUP_TIMEOUT", "900")),
+        startup_poll_seconds=float(_env("MEMEAGENT_VLLM_STARTUP_POLL_SECONDS", "2")),
+        trust_remote_code=_env_bool("MEMEAGENT_VLLM_TRUST_REMOTE_CODE", True),
+        enable_prefix_caching=_env_bool("MEMEAGENT_VLLM_ENABLE_PREFIX_CACHING", True),
+        api_key=_env("MEMEAGENT_SERVICE_API_KEY") or None,
+        backend_api_key=(
+            _env("MEMEAGENT_VLLM_API_KEY")
+            or _env("MEMEAGENT_SERVICE_BACKEND_API_KEY")
+            or None
+        ),
     )
 
 
-def _to_langchain_message(message: dict[str, Any]) -> Any:
-    role = str(message.get("role") or "user").strip().lower()
-    content = message.get("content", "")
-    if role == "system":
-        if isinstance(content, str):
-            return SystemMessage(content=content)
-        return SystemMessage(content=_text_only_content(content))
-    if role == "user":
-        return HumanMessage(content=content)
-    if role == "assistant":
-        return SimpleNamespace(role="assistant", content=content)
-    return SimpleNamespace(role=role or "user", content=content)
+def _auth_headers(settings: ServerSettings) -> dict[str, str]:
+    if not settings.backend_api_key:
+        return {}
+    return {"Authorization": f"Bearer {settings.backend_api_key}"}
 
 
-def _text_only_content(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict) and (item.get("type") == "text" or "text" in item):
-                parts.append(str(item.get("text", "")))
-        return "\n".join(part for part in parts if part)
-    return str(content)
+def _check_frontend_auth(request: Request, settings: ServerSettings) -> None:
+    if not settings.api_key:
+        return
+    auth = request.headers.get("authorization", "")
+    if auth != f"Bearer {settings.api_key}":
+        raise HTTPException(status_code=401, detail="Invalid API key.")
 
 
-def _load_runtime(
+def _wait_for_backend(
+    model: VLLMModelSettings,
     *,
-    name: str,
-    model_path: str,
-    temperature: float,
-    max_tokens: int | None,
-    timeout: float,
-    enable_thinking: bool | None,
-) -> ModelRuntime:
-    client = LocalTransformersChatClient(
-        model_path=model_path,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        timeout=timeout,
-        enable_thinking=enable_thinking,
-    )
-    print(f"[{name}] loading {model_path}", flush=True)
-    client._ensure_loaded()
-    model = getattr(client, "_model", None)
-    device_map = getattr(model, "hf_device_map", None)
-    if device_map:
-        print(f"[{name}] loaded with hf_device_map={device_map}", flush=True)
-    else:
-        print(f"[{name}] loaded on device={getattr(model, 'device', 'unknown')}", flush=True)
-    return ModelRuntime(name=name, client=client, lock=Lock())
-
-
-def _invoke_runtime(
-    runtime: ModelRuntime,
-    messages: list[dict[str, Any]],
-    *,
-    temperature: float | None,
-    max_tokens: int | None,
-) -> ChatResponse:
-    converted = [_to_langchain_message(message) for message in messages]
-    with runtime.lock:
-        old_temperature = runtime.client.temperature
-        old_max_tokens = runtime.client.max_tokens
+    settings: ServerSettings,
+    process: ManagedVLLMProcess | None = None,
+) -> None:
+    deadline = time.time() + settings.startup_timeout_seconds
+    models_url = model.backend_url + "/models"
+    while time.time() < deadline:
+        if process is not None:
+            process.assert_running()
         try:
-            if temperature is not None:
-                runtime.client.temperature = temperature
-            if max_tokens is not None:
-                runtime.client.max_tokens = max_tokens
-            return runtime.client.invoke(converted)
-        finally:
-            runtime.client.temperature = old_temperature
-            runtime.client.max_tokens = old_max_tokens
+            response = requests.get(
+                models_url,
+                headers=_auth_headers(settings),
+                timeout=5,
+            )
+            if response.status_code < 500:
+                print(f"[vLLM:{model.name}] ready at {model.backend_url}", flush=True)
+                return
+        except requests.RequestException:
+            pass
+        time.sleep(settings.startup_poll_seconds)
+    raise RuntimeError(
+        f"Timed out waiting for vLLM backend {model.name!r} at {model.backend_url}."
+    )
 
 
-def _completion_payload(
+def _target_url(model: VLLMModelSettings, endpoint: str) -> str:
+    return model.backend_url.rstrip("/") + endpoint
+
+
+def _forward_json(
     *,
-    completion_id: str,
-    model: str,
-    content: str,
-) -> dict[str, Any]:
-    created = int(time.time())
-    return {
-        "id": completion_id,
-        "object": "chat.completion",
-        "created": created,
-        "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": content},
-                "finish_reason": "stop",
-            }
-        ],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-    }
+    model: VLLMModelSettings,
+    payload: dict[str, Any],
+    settings: ServerSettings,
+) -> JSONResponse:
+    try:
+        response = requests.post(
+            _target_url(model, "/chat/completions"),
+            json=payload,
+            headers=_auth_headers(settings),
+            timeout=None,
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    try:
+        body = response.json()
+    except ValueError:
+        body = {"error": response.text}
+    return JSONResponse(content=body, status_code=response.status_code)
 
 
-def _stream_payloads(*, completion_id: str, model: str, content: str):
-    created = int(time.time())
-    chunks = [
-        {
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-        },
-        {
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
-        },
-        {
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-        },
-    ]
-    import json
+def _forward_stream(
+    *,
+    model: VLLMModelSettings,
+    payload: dict[str, Any],
+    settings: ServerSettings,
+) -> Iterator[bytes]:
+    try:
+        with requests.post(
+            _target_url(model, "/chat/completions"),
+            json=payload,
+            headers=_auth_headers(settings),
+            timeout=None,
+            stream=True,
+        ) as response:
+            response.raise_for_status()
+            for chunk in response.iter_content(chunk_size=None):
+                if chunk:
+                    yield chunk
+    except requests.RequestException as exc:
+        yield f"data: {{\"error\": {str(exc)!r}}}\n\n".encode("utf-8")
+        yield b"data: [DONE]\n\n"
 
-    for chunk in chunks:
-        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-    yield "data: [DONE]\n\n"
+
+def _request_payload(body: ChatCompletionRequest) -> dict[str, Any]:
+    if hasattr(body, "model_dump"):
+        return body.model_dump(exclude_none=True)
+    return body.dict(exclude_none=True)
 
 
 def create_app(settings: ServerSettings) -> FastAPI:
-    app = FastAPI(title="MemeAgent Local Inference Server")
-    runtimes: dict[str, ModelRuntime] = {}
+    model_routes = {
+        settings.main.name: settings.main,
+        settings.controller.name: settings.controller,
+    }
+    processes: list[ManagedVLLMProcess] = []
 
-    @app.on_event("startup")
-    def startup() -> None:
-        runtimes[settings.main_model] = _load_runtime(
-            name=settings.main_model,
-            model_path=settings.main_model_path,
-            temperature=settings.temperature,
-            max_tokens=settings.max_tokens,
-            timeout=settings.timeout,
-            enable_thinking=False,
-        )
-        runtimes[settings.controller_model] = _load_runtime(
-            name=settings.controller_model,
-            model_path=settings.controller_model_path,
-            temperature=settings.controller_temperature,
-            max_tokens=settings.controller_max_tokens,
-            timeout=settings.controller_timeout,
-            enable_thinking=settings.controller_thinking_enabled,
-        )
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        if settings.spawn_vllm:
+            for model in dict.fromkeys(model_routes.values()):
+                process = ManagedVLLMProcess(model, settings)
+                process.start()
+                processes.append(process)
+            for process in processes:
+                _wait_for_backend(process.settings, settings=settings, process=process)
+        else:
+            for model in dict.fromkeys(model_routes.values()):
+                _wait_for_backend(model, settings=settings)
         print(
-            "Local inference server is ready. "
-            f"Models: {', '.join(runtimes)}",
+            "MemeAgent vLLM router is ready. "
+            f"Models: {', '.join(sorted(model_routes))}",
             flush=True,
         )
+        try:
+            yield
+        finally:
+            for process in reversed(processes):
+                process.stop()
+
+    app = FastAPI(title="MemeAgent vLLM Router", lifespan=lifespan)
 
     @app.get("/health")
-    def health() -> dict[str, Any]:
-        return {"status": "ok", "models": sorted(runtimes)}
+    def health(request: Request) -> dict[str, Any]:
+        _check_frontend_auth(request, settings)
+        backends = {}
+        for name, model in model_routes.items():
+            try:
+                response = requests.get(
+                    _target_url(model, "/models"),
+                    headers=_auth_headers(settings),
+                    timeout=5,
+                )
+                backends[name] = {
+                    "status": "ok" if response.ok else "error",
+                    "status_code": response.status_code,
+                    "backend_url": model.backend_url,
+                }
+            except requests.RequestException as exc:
+                backends[name] = {
+                    "status": "error",
+                    "error": str(exc),
+                    "backend_url": model.backend_url,
+                }
+        return {"status": "ok", "models": sorted(model_routes), "backends": backends}
 
     @app.get("/v1/models")
-    def models() -> dict[str, Any]:
+    def models(request: Request) -> dict[str, Any]:
+        _check_frontend_auth(request, settings)
         now = int(time.time())
         return {
             "object": "list",
             "data": [
-                {"id": name, "object": "model", "created": now, "owned_by": "memeagent"}
-                for name in sorted(runtimes)
+                {"id": name, "object": "model", "created": now, "owned_by": "vllm"}
+                for name in sorted(model_routes)
             ],
         }
 
     @app.post("/v1/chat/completions")
-    def chat_completions(request: ChatCompletionRequest):
-        runtime = runtimes.get(request.model)
-        if runtime is None:
+    async def chat_completions(request: Request, body: ChatCompletionRequest):
+        _check_frontend_auth(request, settings)
+        model = model_routes.get(body.model)
+        if model is None:
             raise HTTPException(
                 status_code=404,
-                detail=f"Unknown model {request.model!r}. Available: {', '.join(sorted(runtimes))}",
-            )
-        max_tokens = request.max_tokens or request.max_completion_tokens
-        response = _invoke_runtime(
-            runtime,
-            request.messages,
-            temperature=request.temperature,
-            max_tokens=max_tokens,
-        )
-        content = response.content
-        completion_id = f"chatcmpl-{uuid.uuid4().hex}"
-        if request.stream:
-            return StreamingResponse(
-                _stream_payloads(
-                    completion_id=completion_id,
-                    model=request.model,
-                    content=content,
+                detail=(
+                    f"Unknown model {body.model!r}. "
+                    f"Available: {', '.join(sorted(model_routes))}"
                 ),
+            )
+        payload = _request_payload(body)
+        if body.max_completion_tokens is not None and body.max_tokens is None:
+            payload["max_tokens"] = body.max_completion_tokens
+        if body.stream:
+            return StreamingResponse(
+                _forward_stream(model=model, payload=payload, settings=settings),
                 media_type="text/event-stream",
             )
-        return _completion_payload(
-            completion_id=completion_id,
-            model=request.model,
-            content=content,
-        )
+        return _forward_json(model=model, payload=payload, settings=settings)
 
     return app
 
 
+def _print_model_settings(label: str, settings: VLLMModelSettings) -> None:
+    print(f"  {label}: {settings.name}", flush=True)
+    print(f"    path: {settings.model_path}", flush=True)
+    print(f"    backend: {settings.backend_url}", flush=True)
+    if settings.cuda_visible_devices:
+        print(f"    CUDA_VISIBLE_DEVICES: {settings.cuda_visible_devices}", flush=True)
+    cmd_settings = {
+        "tensor_parallel_size": settings.tensor_parallel_size,
+        "gpu_memory_utilization": settings.gpu_memory_utilization,
+        "max_model_len": settings.max_model_len,
+        "max_num_seqs": settings.max_num_seqs,
+        "max_num_batched_tokens": settings.max_num_batched_tokens,
+        "dtype": settings.dtype,
+        "quantization": settings.quantization,
+        "limit_mm_per_prompt": settings.limit_mm_per_prompt,
+        "extra_args": " ".join(settings.extra_args),
+    }
+    for key, value in cmd_settings.items():
+        if value not in {None, ""}:
+            print(f"    {key}: {value}", flush=True)
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Serve MemeAgent local models.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Serve MemeAgent local models through vLLM OpenAI-compatible backends "
+            "and a small model-name router."
+        )
+    )
     parser.add_argument("--host", default=None, help="Override MEMEAGENT_SERVICE_HOST.")
     parser.add_argument("--port", type=int, default=None, help="Override MEMEAGENT_SERVICE_PORT.")
     parser.add_argument(
+        "--no-spawn",
+        action="store_true",
+        help=(
+            "Do not launch vLLM processes. Proxy to MEMEAGENT_VLLM_*_BACKEND_URL "
+            "instead."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print resolved service settings without loading model weights.",
+        help="Print resolved vLLM/router settings without starting servers.",
     )
     return parser.parse_args()
 
@@ -341,22 +534,37 @@ def main() -> int:
         settings = ServerSettings(**{**settings.__dict__, "host": args.host})
     if args.port:
         settings = ServerSettings(**{**settings.__dict__, "port": args.port})
+    if args.no_spawn:
+        settings = ServerSettings(**{**settings.__dict__, "spawn_vllm": False})
 
-    print("Resolved service settings:", flush=True)
-    print(f"  {settings.main_model}: {settings.main_model_path}", flush=True)
-    print(f"  {settings.controller_model}: {settings.controller_model_path}", flush=True)
-    print(f"  listen: {settings.host}:{settings.port}", flush=True)
+    print("Resolved vLLM service settings:", flush=True)
+    print(f"  router: {settings.host}:{settings.port}", flush=True)
+    print(f"  command: {settings.command}", flush=True)
+    print(f"  spawn_vllm: {settings.spawn_vllm}", flush=True)
+    print(f"  trust_remote_code: {settings.trust_remote_code}", flush=True)
+    print(f"  enable_prefix_caching: {settings.enable_prefix_caching}", flush=True)
+    _print_model_settings("main", settings.main)
+    _print_model_settings("controller", settings.controller)
     if args.dry_run:
         return 0
 
     import uvicorn
 
-    uvicorn.run(
-        create_app(settings),
-        host=settings.host,
-        port=settings.port,
-        log_level="info",
-    )
+    try:
+        uvicorn.run(
+            create_app(settings),
+            host=settings.host,
+            port=settings.port,
+            log_level="info",
+        )
+    except FileNotFoundError as exc:
+        if settings.command in str(exc):
+            print(
+                "Could not find the vLLM command. Install vLLM in this environment "
+                "or set MEMEAGENT_VLLM_COMMAND.",
+                file=sys.stderr,
+            )
+        raise
     return 0
 
 

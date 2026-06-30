@@ -58,17 +58,52 @@ _DEFAULT_CONTEXT_SITES = (
 
 _GENERIC_RELEVANCE_TERMS = {
     "and",
+    "after",
+    "also",
+    "community",
+    "communities",
+    "controversy",
+    "cultural",
+    "culture",
+    "day",
+    "days",
     "for",
     "from",
+    "funny",
+    "general",
+    "good",
+    "how",
+    "humor",
+    "humour",
+    "impact",
+    "internet",
     "image",
     "meme",
     "memes",
+    "nap",
+    "naps",
     "news",
     "origin",
+    "public",
     "reaction",
     "social",
+    "template",
+    "templates",
     "the",
+    "time",
+    "trend",
+    "trends",
+    "want",
+    "wants",
+    "when",
+    "what",
+    "why",
     "with",
+}
+
+_SHORT_DISTINCTIVE_RELEVANCE_TERMS = {
+    "nude",
+    "jeep",
 }
 
 
@@ -103,6 +138,12 @@ class SearchAgentConfig:
 class PlannedSearchQuery:
     query: str
     category: str
+
+
+@dataclass(frozen=True)
+class RelevanceProfile:
+    terms: frozenset[str]
+    strict_terms: frozenset[str]
 
 
 def _clean_text(value: Any) -> str:
@@ -244,9 +285,33 @@ def _query_terms(value: str) -> set[str]:
         term
         for term in re.findall(r"[a-z0-9][a-z0-9_-]{2,}", value)
         if term not in _GENERIC_RELEVANCE_TERMS
+        and (len(term) >= 4 or term in _SHORT_DISTINCTIVE_RELEVANCE_TERMS)
     }
     terms.update(re.findall(r"[\u4e00-\u9fff]{2,}", value))
     return terms
+
+
+def _quoted_phrases(value: str) -> set[str]:
+    phrases: set[str] = set()
+    for phrase in re.findall(r'"([^"]{4,160})"', value):
+        cleaned = " ".join(phrase.lower().split())
+        phrase_terms = _query_terms(cleaned)
+        if len(cleaned) >= 8 and phrase_terms:
+            phrases.add(cleaned)
+    return phrases
+
+
+def _result_haystack(item: dict[str, Any]) -> str:
+    title = _clean_text(item.get("title")).lower()
+    body = _clean_text(item.get("body")).lower()
+    href = _clean_text(item.get("href") or item.get("url")).lower()
+    return f"{title}\n{body}\n{href}"
+
+
+def _term_in_text(haystack: str, term: str) -> bool:
+    if re.search(r"[\u4e00-\u9fff]", term):
+        return term in haystack
+    return bool(re.search(rf"(?<![a-z0-9_-]){re.escape(term)}(?![a-z0-9_-])", haystack))
 
 
 def _contains_word(value: str, word: str) -> bool:
@@ -458,10 +523,25 @@ class WebSearchAgent:
         context: str,
         queries: list[str],
     ) -> set[str]:
+        return set(self._build_relevance_profile(topic, context, queries).terms)
+
+    def _build_relevance_profile(
+        self,
+        topic: str,
+        context: str,
+        queries: list[str],
+    ) -> RelevanceProfile:
         terms: set[str] = set()
         for value in [topic, *self._extract_visual_search_anchors(context), *queries]:
             terms.update(_query_terms(value))
-        return terms
+        strict_terms = set(terms)
+        for phrase in _quoted_phrases(context):
+            strict_terms.update(_query_terms(phrase))
+        strict_terms.difference_update(_GENERIC_RELEVANCE_TERMS)
+        return RelevanceProfile(
+            terms=frozenset(terms),
+            strict_terms=frozenset(strict_terms),
+        )
 
     def _add_planned_query(
         self,
@@ -1213,7 +1293,7 @@ class WebSearchAgent:
 
     def _search_text_queries(
         self,
-        query_input: list[str] | tuple[list[str], set[str]],
+        query_input: list[str] | tuple[list[str], set[str] | RelevanceProfile],
     ) -> list[dict[str, Any]]:
         results, errors = self._search_text_queries_with_errors(query_input)
         self._last_web_errors = errors
@@ -1223,7 +1303,7 @@ class WebSearchAgent:
 
     def _search_text_queries_with_errors(
         self,
-        query_input: list[str] | tuple[list[str], set[str]],
+        query_input: list[str] | tuple[list[str], set[str] | RelevanceProfile],
     ) -> tuple[list[dict[str, Any]], list[str]]:
         if isinstance(query_input, tuple):
             queries, relevance_terms = query_input
@@ -1261,7 +1341,13 @@ class WebSearchAgent:
             queries = query_input
 
         news_queries = self._build_news_queries(queries, context=context)[:6]
-        relevance_terms = set().union(*(_query_terms(query) for query in news_queries))
+        news_terms = set().union(*(_query_terms(query) for query in news_queries))
+        relevance_terms = RelevanceProfile(
+            terms=frozenset(news_terms),
+            strict_terms=frozenset(
+                news_terms.union(*(_query_terms(query) for query in [context]))
+            ),
+        )
         results, errors = self._search_queries_in_parallel(
             queries=news_queries,
             search_fn=self._search_news_provider,
@@ -1275,7 +1361,7 @@ class WebSearchAgent:
         self,
         queries: list[str],
         search_fn,
-        relevance_terms: set[str],
+        relevance_terms: set[str] | RelevanceProfile,
         max_results: int,
         kind: str,
     ) -> tuple[list[dict[str, Any]], list[str]]:
@@ -1418,9 +1504,9 @@ class WebSearchAgent:
         self,
         results: list[dict[str, Any]],
         max_results: int,
-        relevance_terms: set[str] | None = None,
+        relevance_terms: set[str] | RelevanceProfile | None = None,
     ) -> list[dict[str, Any]]:
-        relevance_terms = relevance_terms or set()
+        relevance_profile = self._coerce_relevance_profile(relevance_terms)
         scored: list[tuple[int, int, dict[str, Any]]] = []
         fallback: list[tuple[int, dict[str, Any]]] = []
         seen: set[str] = set()
@@ -1434,18 +1520,38 @@ class WebSearchAgent:
 
             seen.add(key)
 
-            score = self._result_relevance_score(item, relevance_terms)
-            if score > 0 or not relevance_terms:
+            score = self._result_relevance_score(item, set(relevance_profile.terms))
+            if score > 0 and self._passes_strict_relevance(item, relevance_profile):
                 scored.append((score, order, item))
             else:
                 fallback.append((order, item))
 
         scored.sort(key=lambda row: (-row[0], row[1]))
         ranked = [item for _, _, item in scored]
-        if not ranked:
+        if not ranked and not relevance_profile.terms:
             ranked = [item for _, item in fallback]
 
         return ranked[:max_results]
+
+    def _coerce_relevance_profile(
+        self,
+        relevance_terms: set[str] | RelevanceProfile | None,
+    ) -> RelevanceProfile:
+        if isinstance(relevance_terms, RelevanceProfile):
+            return relevance_terms
+        terms = frozenset(relevance_terms or set())
+        return RelevanceProfile(terms=terms, strict_terms=terms)
+
+    def _passes_strict_relevance(
+        self,
+        item: dict[str, Any],
+        relevance_profile: RelevanceProfile,
+    ) -> bool:
+        strict_terms = relevance_profile.strict_terms or relevance_profile.terms
+        if not strict_terms:
+            return True
+        haystack = _result_haystack(item)
+        return any(_term_in_text(haystack, term) for term in strict_terms)
 
     def _result_relevance_score(
         self,
@@ -1462,11 +1568,11 @@ class WebSearchAgent:
 
         score = 0
         for term in relevance_terms:
-            if term in title:
+            if _term_in_text(title, term):
                 score += 3
-            elif term in body:
+            elif _term_in_text(body, term):
                 score += 2
-            elif term in href:
+            elif _term_in_text(href, term):
                 score += 1
         return score
 
@@ -1543,7 +1649,7 @@ class WebSearchAgent:
         self._reset_cache_stats()
         query_plan = self._build_query_plan(topic, context)
         queries = [item.query for item in query_plan]
-        relevance_terms = self._build_relevance_terms(topic, context, queries)
+        relevance_profile = self._build_relevance_profile(topic, context, queries)
 
         sections: list[str] = [
             f"Search provider: {self.config.search_provider}",
@@ -1552,7 +1658,7 @@ class WebSearchAgent:
 
         try:
             self._last_web_errors = []
-            text_results = self._search_text_queries((queries, relevance_terms))
+            text_results = self._search_text_queries((queries, relevance_profile))
         except Exception as exc:
             text_results = []
             sections.append(f"Web search failed: {exc}")
