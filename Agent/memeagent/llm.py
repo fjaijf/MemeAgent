@@ -43,6 +43,8 @@ class OpenAICompatibleChatClient:
         timeout: float | None = None,
         max_tokens: int | None = None,
         max_retries: int | None = None,
+        enable_thinking: bool | None = None,
+        strip_thinking: bool = True,
     ) -> None:
         client_kwargs: dict[str, Any] = {
             "api_key": api_key,
@@ -56,6 +58,9 @@ class OpenAICompatibleChatClient:
         self.model = model or config.model
         self.temperature = config.temperature if temperature is None else temperature
         self.max_tokens = config.max_tokens if max_tokens is None else max_tokens
+        self.base_url = config.base_url
+        self.enable_thinking = self._resolve_enable_thinking(enable_thinking)
+        self.strip_thinking = strip_thinking
 
     def invoke(self, messages: list[Any]) -> ChatResponse:
         request_kwargs: dict[str, Any] = {
@@ -65,9 +70,10 @@ class OpenAICompatibleChatClient:
         }
         if self.max_tokens is not None:
             request_kwargs["max_tokens"] = self.max_tokens
+        self._add_thinking_options(request_kwargs)
 
         response = self.client.chat.completions.create(**request_kwargs)
-        content = response.choices[0].message.content or ""
+        content = self._postprocess_content(response.choices[0].message.content or "")
         return ChatResponse(content=content)
 
     def stream(self, messages: list[Any]):
@@ -79,6 +85,7 @@ class OpenAICompatibleChatClient:
         }
         if self.max_tokens is not None:
             request_kwargs["max_tokens"] = self.max_tokens
+        self._add_thinking_options(request_kwargs)
 
         for chunk in self.client.chat.completions.create(**request_kwargs):
             if not getattr(chunk, "choices", None):
@@ -89,6 +96,35 @@ class OpenAICompatibleChatClient:
             content = getattr(delta, "content", None)
             if content:
                 yield content
+
+    def _resolve_enable_thinking(self, configured: bool | None) -> bool | None:
+        env_value = _env_optional_flag("MEMEAGENT_OPENAI_COMPATIBLE_THINKING")
+        if env_value is not None:
+            return env_value
+        if not _supports_openai_compatible_thinking_options(self.base_url):
+            return None
+        if _is_loopback_base_url(self.base_url):
+            if configured is not None:
+                return configured
+            return _env_optional_flag("MEMEAGENT_LOCAL_THINKING", False)
+        if configured is not None:
+            return configured
+        return None
+
+    def _add_thinking_options(self, request_kwargs: dict[str, Any]) -> None:
+        if self.enable_thinking is None:
+            return
+        if _is_dashscope_base_url(self.base_url):
+            request_kwargs["extra_body"] = {"enable_thinking": self.enable_thinking}
+            return
+        request_kwargs["extra_body"] = {
+            "chat_template_kwargs": {"enable_thinking": self.enable_thinking},
+        }
+
+    def _postprocess_content(self, content: str) -> str:
+        if self.strip_thinking:
+            content = re.sub(r"(?s)<think>.*?</think>\s*", "", content)
+        return content.strip()
 
     def _convert_message(self, message: Any) -> dict[str, Any]:
         if isinstance(message, SystemMessage):
@@ -531,6 +567,22 @@ def _is_qwen_compatible_config(config: MemeAgentConfig) -> bool:
     return model.startswith("qwen") or "dashscope.aliyuncs.com" in base_url
 
 
+def _is_loopback_base_url(base_url: str | None) -> bool:
+    if not base_url:
+        return False
+    parsed = urlparse(base_url)
+    hostname = (parsed.hostname or "").lower()
+    return hostname in {"127.0.0.1", "localhost", "::1"}
+
+
+def _is_dashscope_base_url(base_url: str | None) -> bool:
+    return "dashscope.aliyuncs.com" in (base_url or "").lower()
+
+
+def _supports_openai_compatible_thinking_options(base_url: str | None) -> bool:
+    return _is_loopback_base_url(base_url) or _is_dashscope_base_url(base_url)
+
+
 def _openai_compatible_api_key(config: MemeAgentConfig) -> str:
     if _is_qwen_compatible_config(config):
         api_key = _env_secret(
@@ -591,6 +643,7 @@ def create_llm(config: MemeAgentConfig) -> Any:
         return OpenAICompatibleChatClient(
             config=config,
             api_key=_openai_compatible_api_key(config),
+            strip_thinking=_env_flag("MEMEAGENT_LOCAL_STRIP_THINKING", True),
         )
 
     if config.provider in {"glm", "zai", "zhipu"}:
@@ -632,6 +685,8 @@ def create_controller_llm(config: MemeAgentConfig) -> Any | None:
             timeout=config.controller_timeout,
             max_tokens=config.controller_max_tokens,
             max_retries=config.controller_max_retries,
+            enable_thinking=config.controller_thinking_enabled,
+            strip_thinking=_env_flag("MEMEAGENT_LOCAL_STRIP_THINKING", True),
         )
 
     if provider in {"glm", "zai", "zhipu"}:

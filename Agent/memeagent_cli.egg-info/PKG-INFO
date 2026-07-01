@@ -227,25 +227,6 @@ python main.py --image path/to/meme.png --show-search \
   --controller-max-rounds 3
 ```
 
-## Evaluation Script
-
-For harmful meme detection benchmarks, use the dedicated evaluator:
-
-```bash
-python evaluate_harmful_memes.py --dataset D:\自研Agent\Dataset\label_test.json --mode direct --resume
-```
-
-Common options:
-
-```bash
-python evaluate_harmful_memes.py --dataset D:\自研Agent\Dataset\label_test.json --schema auto --workers 4
-python evaluate_harmful_memes.py --dataset D:\自研Agent\Dataset\label_test.json --mode workflow --search
-python evaluate_harmful_memes.py --dataset D:\自研Agent\Dataset\label_test.json --limit 100 --workers 4 --output runs/eval.jsonl
-```
-
-The script writes per-sample predictions to JSONL and a summary metric file
-with accuracy, precision, recall, and F1.
-
 When images are attached, MemeAgent first asks the vision model to produce an
 OCR/visual-description/keyword report. That image-derived report is then used
 as additional search context before the final meme analysis:

@@ -43,6 +43,7 @@ class LocalInferenceServerTests(unittest.TestCase):
             spawn_vllm=False,
             startup_timeout_seconds=1,
             startup_poll_seconds=0.01,
+            backend_timeout_seconds=60,
             trust_remote_code=True,
             enable_prefix_caching=True,
             api_key=None,
@@ -65,6 +66,7 @@ class LocalInferenceServerTests(unittest.TestCase):
                     json={
                         "model": "memeagent-controller",
                         "messages": [{"role": "user", "content": "hi"}],
+                        "chat_template_kwargs": {"enable_thinking": False},
                     },
                 )
 
@@ -75,6 +77,10 @@ class LocalInferenceServerTests(unittest.TestCase):
             post.call_args.args[0],
         )
         self.assertEqual("memeagent-controller", post.call_args.kwargs["json"]["model"])
+        self.assertEqual(
+            {"enable_thinking": False},
+            post.call_args.kwargs["json"]["chat_template_kwargs"],
+        )
 
 
 if __name__ == "__main__":

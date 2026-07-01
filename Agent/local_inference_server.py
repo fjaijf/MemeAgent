@@ -14,6 +14,11 @@ from typing import Any, Iterator
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+
+try:
+    from pydantic import ConfigDict
+except ImportError:  # pragma: no cover - pydantic v1 compatibility
+    ConfigDict = None
 import requests
 
 from memeagent.config import MemeAgentConfig, load_project_env
@@ -48,6 +53,7 @@ class ServerSettings:
     spawn_vllm: bool
     startup_timeout_seconds: float
     startup_poll_seconds: float
+    backend_timeout_seconds: float | None
     trust_remote_code: bool
     enable_prefix_caching: bool
     api_key: str | None
@@ -55,6 +61,12 @@ class ServerSettings:
 
 
 class ChatCompletionRequest(BaseModel):
+    if ConfigDict is not None:
+        model_config = ConfigDict(extra="allow")
+    else:  # pragma: no cover - pydantic v1 compatibility
+        class Config:
+            extra = "allow"
+
     model: str
     messages: list[dict[str, Any]] = Field(default_factory=list)
     temperature: float | None = None
@@ -251,6 +263,9 @@ def _build_settings(project_root: Path) -> ServerSettings:
     vllm_host = _env("MEMEAGENT_VLLM_HOST", "127.0.0.1")
     main_port = int(_env("MEMEAGENT_VLLM_MAIN_PORT", "8009"))
     controller_port = int(_env("MEMEAGENT_VLLM_CONTROLLER_PORT", "8010"))
+    backend_timeout = _env_float("MEMEAGENT_VLLM_BACKEND_TIMEOUT", config.timeout)
+    if backend_timeout is not None and backend_timeout <= 0:
+        backend_timeout = None
     return ServerSettings(
         main=_model_settings(
             role="main",
@@ -278,6 +293,7 @@ def _build_settings(project_root: Path) -> ServerSettings:
         spawn_vllm=_env_bool("MEMEAGENT_VLLM_SPAWN", True),
         startup_timeout_seconds=float(_env("MEMEAGENT_VLLM_STARTUP_TIMEOUT", "900")),
         startup_poll_seconds=float(_env("MEMEAGENT_VLLM_STARTUP_POLL_SECONDS", "2")),
+        backend_timeout_seconds=backend_timeout,
         trust_remote_code=_env_bool("MEMEAGENT_VLLM_TRUST_REMOTE_CODE", True),
         enable_prefix_caching=_env_bool("MEMEAGENT_VLLM_ENABLE_PREFIX_CACHING", True),
         api_key=_env("MEMEAGENT_SERVICE_API_KEY") or None,
@@ -346,7 +362,7 @@ def _forward_json(
             _target_url(model, "/chat/completions"),
             json=payload,
             headers=_auth_headers(settings),
-            timeout=None,
+            timeout=settings.backend_timeout_seconds,
         )
     except requests.RequestException as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -368,7 +384,7 @@ def _forward_stream(
             _target_url(model, "/chat/completions"),
             json=payload,
             headers=_auth_headers(settings),
-            timeout=None,
+            timeout=settings.backend_timeout_seconds,
             stream=True,
         ) as response:
             response.raise_for_status()
@@ -455,7 +471,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
         }
 
     @app.post("/v1/chat/completions")
-    async def chat_completions(request: Request, body: ChatCompletionRequest):
+    def chat_completions(request: Request, body: ChatCompletionRequest):
         _check_frontend_auth(request, settings)
         model = model_routes.get(body.model)
         if model is None:
