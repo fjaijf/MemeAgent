@@ -913,8 +913,8 @@ class MemeResearchWorkflow:
                         for chunk in self.meme_agent.stream(
                             topic=topic,
                             context=combined_context,
-                            image_paths=image_paths,
-                            image_urls=image_urls,
+                            image_paths=[],
+                            image_urls=[],
                         ):
                             chunks.append(chunk)
                             if analysis_delta:
@@ -924,8 +924,8 @@ class MemeResearchWorkflow:
                             analysis = self.meme_agent.run(
                                 topic=topic,
                                 context=combined_context,
-                                image_paths=image_paths,
-                                image_urls=image_urls,
+                                image_paths=[],
+                                image_urls=[],
                             )
                         else:
                             warning = (
@@ -949,8 +949,8 @@ class MemeResearchWorkflow:
                     analysis = self.meme_agent.run(
                         topic=topic,
                         context=combined_context,
-                        image_paths=image_paths,
-                        image_urls=image_urls,
+                        image_paths=[],
+                        image_urls=[],
                     )
             except Exception as exc:
                 raise RuntimeError("Final analysis LLM call failed.") from exc

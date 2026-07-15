@@ -1,0 +1,29 @@
+{
+  "total": 50,
+  "final_count": 50,
+  "error_count": 0,
+  "gold_harmful_count": 23,
+  "gold_harmless_count": 27,
+  "gold_unknown_count": 0,
+  "prediction_harmful_count": 9,
+  "prediction_harmless_count": 41,
+  "metrics": {
+    "evaluated": 50,
+    "coverage": 1.0,
+    "accuracy": 0.68,
+    "precision": 0.8888888888888888,
+    "recall": 0.34782608695652173,
+    "f1": 0.5,
+    "tp": 8,
+    "tn": 26,
+    "fp": 1,
+    "fn": 15
+  },
+  "output_dir": "/data/ggbond/MemeAgent/Agent/runs/batch_agent_20260712_121616",
+  "max_rounds": 3,
+  "confidence_threshold": 0.85,
+  "main_concurrency": 10,
+  "controller_concurrency": 10,
+  "final_concurrency": 4,
+  "created_at": "2026-07-12T12:29:42"
+}

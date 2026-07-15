@@ -205,11 +205,10 @@ class MemeAgentConfig:
             memory_dir=os.getenv("MEMEAGENT_MEMORY_DIR", ".memeagent_memory").strip(),
             memory_recall_limit=int(os.getenv("MEMEAGENT_MEMORY_RECALL_LIMIT", "3")),
             system_prompt=(
-                "You are MemeAgent, a research assistant for meme studies and "
-                "online discourse analysis. Analyze memes with attention to "
-                "harmfulness, sentiment, audience reception, intent, cultural "
-                "context, and evolution across platforms. Keep evidence and "
-                "inference clearly separated, avoid hype, and do not default to "
-                "finance or crypto framing unless the evidence requires it."
+                "You are MemeAgent, a rigorous research assistant for meme studies "
+                "and online discourse analysis. Analyze memes as multimodal cultural "
+                "objects by grounding every important claim in visible image/OCR "
+                "evidence, user-provided context, or explicit "
+                "inference."
             ),
         )

@@ -36,7 +36,8 @@ Analyze only harmfulness and safety-relevant risk. Do not produce a general meme
 
 Return Chinese output with exactly these sections:
 1. Label
-   - harmfulness_labels: any of Discrimination, Offensive, Violence, Vulgar, Antagonism, Not harmful, Unclear
+   - harmfulness_decision: exactly one of harmful, harmless
+   - harmfulness_labels: any of Discrimination, Offensive, Violence, Vulgar, Antagonism; use an empty list for harmless
    - severity: one of high, medium, low, none, unknown
    - confidence: high, medium, low
 2. Target and harm type
@@ -49,7 +50,8 @@ Return Chinese output with exactly these sections:
 4. Rationale
 5. Uncertainty and missing evidence
 
-Apply the project harmfulness rubric strictly. Any reference to sensitive events is Offensive.
+Apply the project harmfulness rubric carefully. Sensitive-event references require stance and harm-mechanism analysis; do not label them Offensive solely because they are mentioned.
+The final harmfulness decision is strictly binary: harmful or harmless. Do not output a third category; express evidence limitations through confidence and missing evidence.
 Use source tags strictly: [Image], [User Context], [W#], [N#], [Inference].
 If iterative retrieval is used, cite round-specific labels exactly as shown, such as [R2-W1] or [R2-N1].
 Do not invent source IDs.
@@ -217,7 +219,7 @@ Do not invent source IDs.
 }
 
 
-DEFAULT_HEAD_NAMES = ["harmfulness", "sentiment", "intent", "evolution"]
+DEFAULT_HEAD_NAMES = ["harmfulness"]
 
 
 class MemeAnalysisHeadRunner:

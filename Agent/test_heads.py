@@ -35,8 +35,7 @@ class FakeHarmfulnessLLM:
                 """
 {
   "harmful_probability": 0.72,
-  "not_harmful_probability": 0.18,
-  "unclear_probability": 0.10,
+  "not_harmful_probability": 0.28,
   "label_probabilities": {
     "Discrimination": 0.05,
     "Offensive": 0.60,
@@ -85,6 +84,7 @@ class FakeHarmfulnessLLM:
 
 class HeadTests(unittest.TestCase):
     def test_normalize_head_names_supports_commas_and_all(self) -> None:
+        self.assertEqual(normalize_head_names(None), ["harmfulness"])
         self.assertEqual(
             normalize_head_names(["harmfulness,sentiment", "intent"]),
             ["harmfulness", "sentiment", "intent"],
@@ -128,6 +128,7 @@ class HeadTests(unittest.TestCase):
         self.assertIn("Soft-vote breakdown", results[0].output)
         self.assertIn("Counterfactual reasoning", results[0].output)
         self.assertIn("Offensive", results[0].output)
+        self.assertIn("final_decision: harmful", results[0].output)
         self.assertEqual(7, len(llm.messages))
         self.assertIn("shared evidence [Image]", llm.messages[0][1].content)
 

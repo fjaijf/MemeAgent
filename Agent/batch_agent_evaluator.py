@@ -18,6 +18,7 @@ from urllib.parse import urlparse
 
 import requests
 
+from memeagent.agent import build_analysis_iteration_prompt
 from memeagent.config import MemeAgentConfig, load_project_env
 
 
@@ -33,44 +34,8 @@ DEFAULT_IMAGE_FIELDS = (
     "filename",
 )
 DEFAULT_TEXT_FIELDS = ("text", "caption", "ocr", "context", "description", "prompt")
-
-MAIN_SYSTEM_PROMPT = """You are the multimodal analysis model in a MemeAgent batch inference pipeline.
-Analyze the image and any supplied context for a researcher-oriented meme analysis.
-Focus on visible text/OCR, concrete visual entities, image-text relation, sentiment, harmfulness, audience, intent, cultural references, evolution cues, uncertainty, and evidence gaps.
-Keep evidence separate from inference. Return concise JSON when possible."""
-
-CONTROLLER_SYSTEM_PROMPT = """You are the controller model for an iterative MemeAgent batch inference pipeline.
-You review multimodal analyses, decide whether the sample can be finalized, estimate confidence, and produce a researcher-oriented Chinese meme analysis matching the MemeAgent style.
-Return only one JSON object and no markdown."""
-
-PROJECT_RUBRIC = """
-Use these project-specific meme analysis standards.
-
-Harmfulness labels:
-- Discrimination: discriminates based on race, gender, religion, nationality, LGBTQ+ identity, or comparable protected/social identity.
-- Offensive: insults, belittles, or maliciously attacks individuals or groups. Any reference to sensitive events, including disasters, pandemics, historical tragedies, racial issues, or violent incidents, is offensive in any form: humorous, sarcastic, dismissive, factual, or otherwise.
-- Violence: directly or indirectly encourages, endorses, threatens, celebrates, or depicts violent behavior.
-- Vulgar: sexual implication, obscenity, nudity, vulgar language, or implicit sexual behavior information in any form.
-- Antagonism: aggressive discontent, resentment, or negativity toward groups or society through hostile satire, malicious sarcasm, harmful exaggeration, pessimism, or nihilism without constructive intent.
-
-Sentiment labels:
-- Joy, Sadness, Anger, Disgust, Fear, Surprise.
-
-Audience prediction:
-- Gemeinschaft-oriented audience: micro-level, high-context, subcultural, domain-specific, ideological, or localized in-group.
-- Gesellschaft-oriented audience: macro-level mass internet society.
-
-Intent detection:
-- Teleological, Normative, Dramaturgical, Communicative.
-
-Evolution analysis:
-- Multimodal phylogenetic tracking, Core kernel fidelity, Lifecycle and diffusion dynamics, Semiotic and intertextual splicing.
-
-Evidence discipline:
-- Separate direct image/OCR evidence, user context, retrieved evidence, and inference.
-- Do not invent entities, source IDs, platforms, dates, intent, audience, or evolution history.
-""".strip()
-
+DEFAULT_BATCH_MAIN_MODEL = "memeagent-main"
+DEFAULT_BATCH_CONTROLLER_MODEL = "memeagent-controller"
 
 @dataclass
 class SampleState:
@@ -83,12 +48,17 @@ class SampleState:
     status: str = "needs_main"
     round_index: int = 0
     next_questions: list[str] = field(default_factory=list)
+    retrieval_questions: list[str] = field(default_factory=list)
+    no_progress_rounds: int = 0
     main_outputs: list[dict[str, Any]] = field(default_factory=list)
     controller_outputs: list[dict[str, Any]] = field(default_factory=list)
+    final_outputs: list[dict[str, Any]] = field(default_factory=list)
     final_answer: str = ""
-    prediction_label: str = "unclear"
-    prediction_binary: int | None = None
+    prediction_label: str = "harmless"
+    prediction_binary: int = 0
+    prediction_source: str = "controller"
     harmfulness_analysis: str = ""
+    harmfulness_labels: list[str] = field(default_factory=list)
     final_confidence: float | None = None
     final_reason: str = ""
     error: str = ""
@@ -109,12 +79,14 @@ class ChatEndpoint:
         messages: list[dict[str, Any]],
         temperature: float,
         max_tokens: int | None,
+        enable_thinking: bool = False,
     ) -> str:
         url = self.base_url.rstrip("/") + "/chat/completions"
         payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
             "temperature": temperature,
+            "chat_template_kwargs": {"enable_thinking": enable_thinking},
         }
         if max_tokens is not None and max_tokens > 0:
             payload["max_tokens"] = max_tokens
@@ -177,8 +149,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--offset", type=int, default=0, help="Skip this many samples.")
     parser.add_argument("--base-url", default="", help="OpenAI-compatible base URL.")
     parser.add_argument("--api-key", default="", help="OpenAI-compatible API key.")
-    parser.add_argument("--main-model", default="", help="Main multimodal model name.")
-    parser.add_argument("--controller-model", default="", help="Controller model name.")
+    parser.add_argument(
+        "--main-model",
+        default="",
+        help=(
+            "Main multimodal service model name. "
+            f"Defaults to {DEFAULT_BATCH_MAIN_MODEL}."
+        ),
+    )
+    parser.add_argument(
+        "--controller-model",
+        default="",
+        help=(
+            "Controller service model name. "
+            f"Defaults to {DEFAULT_BATCH_CONTROLLER_MODEL}."
+        ),
+    )
     parser.add_argument(
         "--main-concurrency",
         type=int,
@@ -190,6 +176,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=int(os.getenv("MEMEAGENT_BATCH_CONTROLLER_CONCURRENCY", "8")),
         help="Concurrent controller-model requests per wave.",
+    )
+    parser.add_argument(
+        "--final-concurrency",
+        type=int,
+        default=int(os.getenv("MEMEAGENT_BATCH_FINAL_CONCURRENCY", "4")),
+        help="Concurrent final-analysis requests to the main model.",
     )
     parser.add_argument(
         "--max-rounds",
@@ -214,6 +206,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=int(os.getenv("MEMEAGENT_BATCH_CONTROLLER_MAX_TOKENS", "2200")),
         help="Max output tokens for controller calls. Use 0 to omit.",
+    )
+    parser.add_argument(
+        "--final-max-tokens",
+        type=int,
+        default=int(os.getenv("MEMEAGENT_BATCH_FINAL_MAX_TOKENS", "2048")),
+        help="Max output tokens for the main model's final analysis. Use 0 to omit.",
     )
     parser.add_argument(
         "--temperature",
@@ -269,8 +267,12 @@ def main() -> int:
         retries=max(args.retries, 0),
         strip_thinking=_env_bool("MEMEAGENT_LOCAL_STRIP_THINKING", True),
     )
-    main_model = args.main_model.strip() or config.model
-    controller_model = args.controller_model.strip() or config.controller_model or main_model
+    main_model = args.main_model.strip() or config.model or DEFAULT_BATCH_MAIN_MODEL
+    controller_model = (
+        args.controller_model.strip()
+        or config.controller_model
+        or DEFAULT_BATCH_CONTROLLER_MODEL
+    )
     samples = _load_samples(args)
     output_dir = _resolve_output_dir(args.output_dir, project_root)
 
@@ -283,6 +285,7 @@ def main() -> int:
         f"concurrency={args.controller_concurrency}",
         flush=True,
     )
+    print(f"Final analysis: main model concurrency={args.final_concurrency}", flush=True)
     print(
         f"Max rounds: {args.max_rounds} confidence_threshold={args.confidence_threshold}",
         flush=True,
@@ -339,6 +342,7 @@ def main() -> int:
                 temperature=args.controller_temperature,
                 max_tokens=_optional_positive(args.controller_max_tokens),
                 confidence_threshold=args.confidence_threshold,
+                max_rounds=max(args.max_rounds, 1),
                 is_last_round=round_index >= max(args.max_rounds, 1) - 1,
                 save_prompts=args.save_prompts,
             )
@@ -349,13 +353,35 @@ def main() -> int:
             )
             batch_index += 1
 
-        active = [sample for sample in samples if sample.status not in {"final", "error"}]
+        active = [
+            sample
+            for sample in samples
+            if sample.status not in {"needs_final", "final", "error"}
+        ]
         if not active:
             break
 
     for sample in samples:
-        if sample.status not in {"final", "error"}:
+        if sample.status not in {"needs_final", "final", "error"}:
             _force_finalize(sample)
+
+    final_candidates = [sample for sample in samples if sample.status == "needs_final"]
+    if final_candidates:
+        print(f"[post] final analysis wave: {len(final_candidates)} samples", flush=True)
+        final_analysis_records = _run_final_wave(
+            samples=final_candidates,
+            endpoint=endpoint,
+            model=main_model,
+            concurrency=max(args.final_concurrency, 1),
+            temperature=args.temperature,
+            max_tokens=_optional_positive(args.final_max_tokens),
+            save_prompts=args.save_prompts,
+        )
+        _write_jsonl(
+            output_dir / f"batch_{batch_index:03d}_final_analysis.jsonl",
+            final_analysis_records,
+        )
+        batch_index += 1
 
     final_records = [_final_record(sample) for sample in samples]
     _write_jsonl(output_dir / "final_results.jsonl", final_records)
@@ -403,6 +429,37 @@ def _run_main_wave(
     return records
 
 
+def _run_final_wave(
+    *,
+    samples: list[SampleState],
+    endpoint: ChatEndpoint,
+    model: str,
+    concurrency: int,
+    temperature: float,
+    max_tokens: int | None,
+    save_prompts: bool,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = {
+            executor.submit(
+                _call_final,
+                input_index=index,
+                sample=sample,
+                endpoint=endpoint,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                save_prompts=save_prompts,
+            ): index
+            for index, sample in enumerate(samples)
+        }
+        for future in as_completed(futures):
+            records.append(future.result())
+    records.sort(key=lambda item: item["input_index"])
+    return records
+
+
 def _run_controller_wave(
     *,
     samples: list[SampleState],
@@ -413,6 +470,7 @@ def _run_controller_wave(
     temperature: float,
     max_tokens: int | None,
     confidence_threshold: float,
+    max_rounds: int,
     is_last_round: bool,
     save_prompts: bool,
 ) -> list[dict[str, Any]]:
@@ -429,6 +487,7 @@ def _run_controller_wave(
                 temperature=temperature,
                 max_tokens=max_tokens,
                 confidence_threshold=confidence_threshold,
+                max_rounds=max_rounds,
                 is_last_round=is_last_round,
                 save_prompts=save_prompts,
             ): index
@@ -463,7 +522,7 @@ def _call_main(
         record["prompt"] = prompt
     try:
         messages = [
-            {"role": "system", "content": MAIN_SYSTEM_PROMPT},
+            {"role": "system", "content": _main_system_prompt()},
             {"role": "user", "content": _vision_content(prompt, sample.image_path)},
         ]
         output = endpoint.chat(
@@ -473,15 +532,22 @@ def _call_main(
             max_tokens=max_tokens,
         )
         parsed = _extract_json_object(output)
+        normalized = _normalize_main_analysis(parsed)
         record.update(
             {
                 "output": output,
-                "parsed": parsed,
+                "parsed": normalized or parsed,
                 "latency_seconds": round(time.time() - started, 3),
                 "error": "",
             }
         )
+        has_new_evidence = _has_genuinely_new_evidence(sample, normalized)
         sample.main_outputs.append(_compact_batch_record(record))
+        if round_index > 0 and normalized:
+            if has_new_evidence:
+                sample.no_progress_rounds = 0
+            else:
+                sample.no_progress_rounds += 1
         sample.status = "needs_controller"
     except Exception as exc:  # noqa: BLE001 - continue other samples.
         sample.status = "error"
@@ -490,6 +556,69 @@ def _call_main(
             {
                 "output": "",
                 "parsed": {},
+                "latency_seconds": round(time.time() - started, 3),
+                "error": str(exc),
+            }
+        )
+    return record
+
+
+def _call_final(
+    *,
+    input_index: int,
+    sample: SampleState,
+    endpoint: ChatEndpoint,
+    model: str,
+    temperature: float,
+    max_tokens: int | None,
+    save_prompts: bool,
+) -> dict[str, Any]:
+    started = time.time()
+    prompt = _final_prompt(sample)
+    record = _base_record(
+        sample,
+        role="final",
+        round_index=sample.round_index,
+        input_index=input_index,
+    )
+    if save_prompts:
+        record["prompt"] = prompt
+    try:
+        output = endpoint.chat(
+            model=model,
+            messages=[
+                {"role": "system", "content": _main_system_prompt()},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        parsed = _extract_json_object(output)
+        decision = _normalize_final_analysis(
+            sample=sample,
+            output=output,
+            parsed=parsed,
+        )
+        record.update(
+            {
+                "output": output,
+                "parsed": parsed,
+                "decision": decision,
+                "latency_seconds": round(time.time() - started, 3),
+                "error": "",
+            }
+        )
+        sample.final_outputs.append(_compact_batch_record(record))
+        _apply_final_analysis(sample, decision)
+        sample.status = "final"
+    except Exception as exc:  # noqa: BLE001 - continue other samples.
+        sample.status = "error"
+        sample.error = str(exc)
+        record.update(
+            {
+                "output": "",
+                "parsed": {},
+                "decision": {},
                 "latency_seconds": round(time.time() - started, 3),
                 "error": str(exc),
             }
@@ -507,11 +636,16 @@ def _call_controller(
     temperature: float,
     max_tokens: int | None,
     confidence_threshold: float,
+    max_rounds: int,
     is_last_round: bool,
     save_prompts: bool,
 ) -> dict[str, Any]:
     started = time.time()
-    prompt = _controller_prompt(sample, confidence_threshold=confidence_threshold)
+    prompt = _controller_prompt(
+        sample,
+        confidence_threshold=confidence_threshold,
+        max_rounds=max_rounds,
+    )
     record = _base_record(
         sample,
         role="controller",
@@ -522,7 +656,7 @@ def _call_controller(
         record["prompt"] = prompt
     try:
         messages = [
-            {"role": "system", "content": CONTROLLER_SYSTEM_PROMPT},
+            {"role": "system", "content": _main_system_prompt()},
             {"role": "user", "content": prompt},
         ]
         output = endpoint.chat(
@@ -530,6 +664,7 @@ def _call_controller(
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
+            enable_thinking=True,
         )
         parsed = _extract_json_object(output)
         decision = _normalize_controller_decision(
@@ -566,118 +701,256 @@ def _call_controller(
 
 def _main_prompt(sample: SampleState, round_index: int) -> str:
     if round_index == 0 or not sample.main_outputs:
-        return f"""Analyze this meme image as evidence for a researcher-oriented MemeAgent report.
+        task = """Perform the first image-grounded analysis. Inspect exact OCR,
+visible entities, layout, symbols, gestures, editing, image-text relation,
+target, stance, concrete harmfulness cues, and visible source clues. Separate
+confirmed pixel evidence from inference."""
+    else:
+        previous = _batch_visual_report(sample)
+        questions = "\n".join(f"- {item}" for item in sample.next_questions) or (
+            "- Re-check the image carefully."
+        )
+        task = f"""Perform a targeted visual follow-up. Answer only the current
+controller questions and report only genuinely new image-grounded evidence.
 
-Optional context:
-{sample.context or "None"}
-
-Project rubric:
-{PROJECT_RUBRIC}
-
-Return a compact JSON object with these keys:
-- ocr_text: visible text, or empty string
-- visual_description: concrete visible entities/actions
-- subjects: people, groups, objects, symbols, or communities referenced if any
-- image_text_relation: how text and image interact
-- sentiment_analysis: primary and secondary sentiment labels with evidence
-- harmfulness_analysis: labels, target, harm type, evidence, uncertainty, and whether the image is harmful or harmless
-- audience_prediction: Gemeinschaft-oriented or Gesellschaft-oriented with evidence
-- intent_recognition: Teleological, Normative, Dramaturgical, Communicative, mixed, or unclear
-- evolution_tracking: template lineage, visual drift, intertextual splicing, or unknown
-- evidence: concrete evidence from the image
-- confidence: number from 0 to 1
-- missing_information: list of uncertainties
-"""
-
-    previous = _clip(_latest_output(sample.main_outputs), 4000)
-    questions = "\n".join(f"- {item}" for item in sample.next_questions) or "- Re-check the image carefully."
-    return f"""Re-examine the same meme image for a researcher-oriented MemeAgent report.
-
-Previous multimodal analysis:
-{previous}
-
-Controller follow-up questions:
+Current controller questions:
 {questions}
 
-Optional context:
-{sample.context or "None"}
+Previous structured visual report:
+{_clip(previous, 4000)}"""
+    return f"""You are the multimodal evidence model in an image-only meme analysis pipeline.
 
-Project rubric:
-{PROJECT_RUBRIC}
+Sample: {sample.sample_id}
+User context: {sample.context or "None"}
 
-Return a compact JSON object with updated evidence and these keys:
-- answers_to_followup: list of direct answers
-- corrected_ocr_text: visible text, or empty string
-- updated_visual_evidence: concrete image evidence
-- updated_harmfulness_analysis: harmfulness labels, target, evidence, uncertainty, and harmful/harmless judgement
-- updated_sentiment_audience_intent_evolution: concise notes
-- confidence: number from 0 to 1
-- remaining_uncertainties: list
+{task}
+
+Return only one JSON object with this exact shape:
+{{
+  "direct_answers": [
+    {{
+      "question": "controller question or initial analysis goal",
+      "answer": "direct answer",
+      "answerability": "answered|not_visible|uncertain|requires_retrieval",
+      "evidence": "visible pixel/OCR evidence only",
+      "confidence": 0.0
+    }}
+  ],
+  "visible_evidence": [],
+  "inferences": [],
+  "new_evidence": [],
+  "unresolved_visual_questions": [],
+  "retrieval_required": false
+}}
+
+Do not output planning, a thinking process, task restatement, drafting notes,
+self-correction, or markdown. On follow-up rounds, new_evidence must contain
+only evidence not already present in the previous report. Use an empty list
+when re-examination found nothing new. Mark source history, statistical
+verification, creator intent, audience reception, and documented meme usage
+as requires_retrieval rather than guessing.
 """
 
 
-def _controller_prompt(sample: SampleState, *, confidence_threshold: float) -> str:
-    main_history = [
-        {
-            "round": item.get("round"),
-            "output": _clip(str(item.get("output", "")), 3500),
-            "parsed": item.get("parsed", {}),
-        }
-        for item in sample.main_outputs[-3:]
-    ]
-    controller_history = [
-        {
-            "round": item.get("round"),
-            "decision": item.get("decision", {}),
-        }
-        for item in sample.controller_outputs[-3:]
-    ]
-    payload = {
-        "sample_id": sample.sample_id,
-        "image_path": str(sample.image_path),
-        "context": sample.context,
-        "confidence_threshold": confidence_threshold,
-        "main_analysis_history": main_history,
-        "previous_controller_decisions": controller_history,
-    }
-    return f"""Review the following meme analysis state and produce the final batch output.
+def _controller_prompt(
+    sample: SampleState,
+    *,
+    confidence_threshold: float,
+    max_rounds: int,
+) -> str:
+    visual_report = _batch_visual_report(sample)
+    iteration_history = _batch_controller_history(sample)
+    controller_prompt = build_analysis_iteration_prompt(
+        topic=sample.sample_id,
+        context=sample.context,
+        visual_report=visual_report,
+        search_report="None",
+        iteration_history=iteration_history,
+        input_mode="image_only",
+        round_index=max(sample.round_index, 0) + 1,
+        max_rounds=max(max_rounds, 1),
+        confidence_threshold=confidence_threshold,
+        retrieval_enabled=False,
+    )
+    return f"""{controller_prompt}
 
-{json.dumps(payload, ensure_ascii=False, indent=2)}
-
-Project rubric:
-{PROJECT_RUBRIC}
-
-Decide whether the sample should be finalized. Finalize only when the analysis is clear enough or no useful visual follow-up remains. If not final, ask 1-5 specific questions for the multimodal model to answer in the next round.
-
-When finalizing, write final_answer as a researcher-oriented Chinese MemeAgent report with exactly these sections:
-1. Meme object and context
-2. Visual/OCR evidence
-3. Sentiment analysis
-4. Harmfulness analysis
-5. Audience and reception prediction
-6. Intent recognition
-7. Evolution tracking
-8. Evidence map
-9. Evidence gaps and overall confidence
-
-The Harmfulness analysis section must explicitly state whether the meme is harmful or harmless.
-
-Return exactly this JSON shape:
+Ignore any earlier output-format instructions and return exactly this JSON
+shape so the batch evaluator can parse it:
 {{
   "should_finalize": true,
   "confidence": 0.0,
-  "prediction_label": "harmful",
-  "prediction_binary": 1,
-  "harmfulness_labels": ["Offensive"],
-  "harmfulness_analysis": "the Harmfulness analysis section only",
-  "final_answer": "complete Chinese report with the 9 sections above",
+  "prediction_label": "harmless",
+  "prediction_binary": 0,
+  "harmfulness_labels": [],
+  "harmfulness_analysis": "current evidence-based harmfulness judgement",
   "reason": "short evidence-based reason",
-  "next_questions": []
+  "next_questions": [],
+  "retrieval_questions": []
 }}
 
-prediction_label must be exactly one of: harmful, harmless, unclear.
-prediction_binary must be 1 for harmful, 0 for harmless, and null for unclear.
+prediction_label must be exactly one of: harmful, harmless.
+prediction_binary must be 1 for harmful and 0 for harmless.
+Image-text
+combinations may provide an implicit target even when OCR does not name one;
+do not default to harmless when that multimodal relation supports a concrete
+harm mechanism.
+This evaluator is running in image-only mode. next_questions may contain only
+questions answerable by re-examining image pixels: OCR, visible watermarks,
+entities, symbols, composition, target, stance, and image-text relation.
+Put source history, fact/statistic verification, creator intent, audience
+reception, and documented meme-template usage in retrieval_questions. If all
+remaining questions require retrieval, set should_finalize=true. Do not repeat
+a visual question that the latest main analysis already answered. If the latest
+main analysis reports no new evidence, finalize with the remaining uncertainty.
+Return only one JSON object and no markdown.
 """
+
+
+def _final_prompt(sample: SampleState) -> str:
+    context_parts = []
+    if sample.context.strip():
+        context_parts.append(f"[User Context]\n{sample.context.strip()}")
+    context_parts.append(
+        "Controller planning and confidence report:\n"
+        + _batch_controller_history(sample)
+    )
+    context_parts.append(
+        "Cumulative image analysis after controller-directed passes:\n"
+        + _batch_visual_report(sample)
+    )
+    context_text = "\n\n".join(context_parts)
+    return f"""Topic: {sample.sample_id}
+
+The controller has already made the classification decision:
+- prediction_label: {sample.prediction_label}
+- prediction_binary: {sample.prediction_binary}
+- confidence: {sample.final_confidence}
+
+{context_text}
+
+Write a concise evidence-based explanation of the controller's decision. Do
+not reconsider or change the label. Return only one JSON object:
+{{
+  "meme_object_and_context": "concise description",
+  "visual_ocr_evidence": "confirmed visible evidence",
+  "harmfulness_analysis": "why the fixed label is supported",
+  "limitations": "remaining uncertainty"
+}}
+
+Do not output planning, thinking, task restatement, drafting notes,
+self-correction, or markdown. Keep the complete response under 500 words.
+"""
+
+
+def _main_system_prompt() -> str:
+    return MemeAgentConfig.from_env().system_prompt
+
+
+def _batch_visual_report(sample: SampleState) -> str:
+    if not sample.main_outputs:
+        return "None"
+    blocks = []
+    for item in sample.main_outputs[-3:]:
+        round_label = item.get("round", "?")
+        parsed = item.get("parsed", {})
+        evidence = ""
+        if parsed:
+            evidence = _clip(json.dumps(parsed, ensure_ascii=False, indent=2), 3500)
+        if not evidence:
+            evidence = _clip(str(item.get("output", "")), 3500)
+        blocks.append(
+            f"## Batch Image Analysis Round {round_label}\n\n"
+            f"{evidence or 'No usable visual evidence.'}"
+        )
+    return "\n\n".join(blocks).strip()
+
+
+def _batch_controller_history(sample: SampleState) -> str:
+    if not sample.controller_outputs:
+        return "None"
+    blocks = []
+    for item in sample.controller_outputs[-3:]:
+        round_label = item.get("round", "?")
+        decision = item.get("decision", {})
+        blocks.append(
+            f"## Batch Controller Round {round_label}\n\n"
+            f"{json.dumps(decision, ensure_ascii=False, indent=2)}"
+        )
+    return "\n\n".join(blocks).strip()
+
+
+def _normalize_main_analysis(parsed: dict[str, Any]) -> dict[str, Any]:
+    if not parsed:
+        return {}
+    expected_keys = {
+        "direct_answers",
+        "visible_evidence",
+        "inferences",
+        "new_evidence",
+        "unresolved_visual_questions",
+        "retrieval_required",
+    }
+    if not expected_keys.intersection(parsed):
+        return {}
+
+    direct_answers: list[dict[str, Any]] = []
+    raw_answers = parsed.get("direct_answers")
+    if isinstance(raw_answers, list):
+        for item in raw_answers:
+            if not isinstance(item, dict):
+                continue
+            answerability = str(item.get("answerability") or "uncertain").strip().lower()
+            if answerability not in {
+                "answered",
+                "not_visible",
+                "uncertain",
+                "requires_retrieval",
+            }:
+                answerability = "uncertain"
+            direct_answers.append(
+                {
+                    "question": str(item.get("question") or "").strip(),
+                    "answer": str(item.get("answer") or "").strip(),
+                    "answerability": answerability,
+                    "evidence": str(item.get("evidence") or "").strip(),
+                    "confidence": _parse_confidence(item.get("confidence")),
+                }
+            )
+
+    return {
+        "direct_answers": direct_answers,
+        "visible_evidence": _normalize_string_list(parsed.get("visible_evidence")),
+        "inferences": _normalize_string_list(parsed.get("inferences")),
+        "new_evidence": _normalize_string_list(parsed.get("new_evidence")),
+        "unresolved_visual_questions": _normalize_questions(
+            parsed.get("unresolved_visual_questions")
+        ),
+        "retrieval_required": bool(_parse_bool(parsed.get("retrieval_required"))),
+    }
+
+
+def _has_genuinely_new_evidence(
+    sample: SampleState,
+    analysis: dict[str, Any],
+) -> bool:
+    def key(value: Any) -> str:
+        return " ".join(str(value).casefold().split())
+
+    previous_evidence: set[str] = set()
+    for record in sample.main_outputs:
+        parsed = record.get("parsed")
+        if not isinstance(parsed, dict):
+            continue
+        for field_name in ("visible_evidence", "new_evidence"):
+            previous_evidence.update(
+                key(item) for item in _normalize_string_list(parsed.get(field_name))
+            )
+
+    candidates = {
+        key(item) for item in _normalize_string_list(analysis.get("new_evidence"))
+    }
+    candidates.discard("")
+    return bool(candidates - previous_evidence)
 
 
 def _normalize_controller_decision(
@@ -688,14 +961,7 @@ def _normalize_controller_decision(
     is_last_round: bool,
 ) -> dict[str, Any]:
     confidence = _parse_confidence(parsed.get("confidence"))
-    final_answer = str(
-        parsed.get("final_answer")
-        or parsed.get("answer")
-        or parsed.get("analysis")
-        or parsed.get("summary")
-        or ""
-    ).strip()
-    prediction_label = _normalize_prediction_label(
+    label_value = (
         parsed.get("prediction_label")
         or parsed.get("label")
         or parsed.get("final_decision")
@@ -703,14 +969,15 @@ def _normalize_controller_decision(
     )
     prediction_binary = _prediction_binary_from_values(
         parsed.get("prediction_binary"),
-        prediction_label,
-        final_answer,
+        str(label_value or ""),
+        "",
         str(parsed.get("harmfulness_analysis") or ""),
     )
+    prediction_label = "harmful" if prediction_binary == 1 else "harmless"
     harmfulness_analysis = str(
         parsed.get("harmfulness_analysis")
         or parsed.get("harmfulness")
-        or _extract_harmfulness_section(final_answer)
+        or _extract_harmfulness_section(output)
     ).strip()
     should_finalize = _parse_bool(parsed.get("should_finalize"))
     if should_finalize is None:
@@ -723,9 +990,12 @@ def _normalize_controller_decision(
         or parsed.get("followup_questions")
         or parsed.get("questions")
     )
+    retrieval_questions = _normalize_questions(parsed.get("retrieval_questions"))
+    if retrieval_questions and not questions:
+        should_finalize = True
     if not should_finalize and not questions:
         questions = [
-            "Re-check OCR, concrete visual details, image-text relation, likely intent, sentiment, audience, and remaining uncertainty."
+            "Re-check OCR, concrete visual details, image-text relation, target, stance, and concrete harm mechanism."
         ]
 
     return {
@@ -735,25 +1005,70 @@ def _normalize_controller_decision(
         "prediction_binary": prediction_binary,
         "harmfulness_analysis": harmfulness_analysis,
         "harmfulness_labels": _normalize_string_list(parsed.get("harmfulness_labels")),
-        "final_answer": final_answer or _fallback_final_answer(output, parsed),
         "reason": str(parsed.get("reason") or parsed.get("rationale") or "").strip(),
         "next_questions": questions,
+        "retrieval_questions": retrieval_questions,
+    }
+
+
+def _normalize_final_analysis(
+    *,
+    sample: SampleState,
+    output: str,
+    parsed: dict[str, Any],
+) -> dict[str, Any]:
+    harmfulness_analysis = str(
+        parsed.get("harmfulness_analysis")
+        or parsed.get("harmfulness")
+        or _extract_harmfulness_section(output)
+        or sample.harmfulness_analysis
+    ).strip()
+    return {
+        "prediction_label": sample.prediction_label,
+        "prediction_binary": sample.prediction_binary,
+        "prediction_source": sample.prediction_source,
+        "harmfulness_analysis": harmfulness_analysis,
+        "harmfulness_labels": _normalize_string_list(
+            parsed.get("harmfulness_labels")
+        ),
+        "confidence": _parse_confidence(parsed.get("confidence"))
+        or sample.final_confidence,
+        "final_answer": output.strip(),
+        "reason": str(
+            parsed.get("reason") or sample.final_reason or "controller decision"
+        ).strip(),
     }
 
 
 def _apply_controller_decision(sample: SampleState, decision: dict[str, Any]) -> None:
-    sample.final_answer = str(decision.get("final_answer") or "")
-    sample.prediction_label = str(decision.get("prediction_label") or "unclear")
-    sample.prediction_binary = decision.get("prediction_binary")
+    sample.prediction_label = str(decision.get("prediction_label") or "harmless")
+    sample.prediction_binary = int(decision.get("prediction_binary") == 1)
+    sample.prediction_source = "controller"
     sample.harmfulness_analysis = str(decision.get("harmfulness_analysis") or "")
+    sample.harmfulness_labels = list(decision.get("harmfulness_labels") or [])
     sample.final_confidence = decision.get("confidence")
     sample.final_reason = str(decision.get("reason") or "")
     sample.next_questions = list(decision.get("next_questions") or [])
+    sample.retrieval_questions = list(decision.get("retrieval_questions") or [])
     sample.round_index += 1
-    if decision.get("should_finalize"):
-        sample.status = "final"
+    no_progress = sample.no_progress_rounds > 0
+    retrieval_only = bool(sample.retrieval_questions and not sample.next_questions)
+    if no_progress:
+        suffix = "No new image-grounded evidence was found in the latest follow-up."
+        sample.final_reason = " ".join(part for part in (sample.final_reason, suffix) if part)
+    if decision.get("should_finalize") or no_progress or retrieval_only:
+        sample.status = "needs_final"
     else:
         sample.status = "needs_main"
+
+
+def _apply_final_analysis(sample: SampleState, decision: dict[str, Any]) -> None:
+    sample.final_answer = str(decision.get("final_answer") or "")
+    sample.prediction_label = str(decision.get("prediction_label") or "harmless")
+    sample.prediction_binary = int(decision.get("prediction_binary") == 1)
+    sample.harmfulness_analysis = str(decision.get("harmfulness_analysis") or "")
+    sample.final_confidence = decision.get("confidence")
+    sample.final_reason = str(decision.get("reason") or "final main-model synthesis")
 
 
 def _force_finalize(sample: SampleState) -> None:
@@ -761,26 +1076,28 @@ def _force_finalize(sample: SampleState) -> None:
         sample.controller_outputs[-1].get("decision", {}) if sample.controller_outputs else {}
     )
     if last_decision:
-        sample.final_answer = str(last_decision.get("final_answer") or "")
-        sample.prediction_label = str(last_decision.get("prediction_label") or "unclear")
-        sample.prediction_binary = last_decision.get("prediction_binary")
+        sample.prediction_label = str(last_decision.get("prediction_label") or "harmless")
+        sample.prediction_binary = int(last_decision.get("prediction_binary") == 1)
         sample.harmfulness_analysis = str(last_decision.get("harmfulness_analysis") or "")
+        sample.harmfulness_labels = list(last_decision.get("harmfulness_labels") or [])
         sample.final_confidence = last_decision.get("confidence")
         sample.final_reason = str(last_decision.get("reason") or "max rounds reached")
     elif sample.main_outputs:
         text = _latest_output(sample.main_outputs)
         sample.final_answer = _fallback_final_answer(text, _extract_json_object(text))
         sample.harmfulness_analysis = _extract_harmfulness_section(sample.final_answer)
-        sample.prediction_label = _normalize_prediction_label(None)
+        sample.prediction_label = "harmless"
         sample.prediction_binary = _prediction_binary_from_values(
             None,
-            sample.prediction_label,
+            "",
             sample.final_answer,
             sample.harmfulness_analysis,
         )
+        sample.prediction_label = "harmful" if sample.prediction_binary == 1 else "harmless"
+        sample.prediction_source = "main_fallback"
         sample.final_confidence = _parse_confidence(_extract_json_object(text).get("confidence"))
         sample.final_reason = "max rounds reached before controller finalization"
-    sample.status = "final"
+    sample.status = "needs_final"
 
 
 def _vision_content(prompt: str, image_path: Path) -> list[dict[str, Any]]:
@@ -1037,19 +1354,18 @@ def _final_record(sample: SampleState) -> dict[str, Any]:
         "gold_binary": sample.gold_binary,
         "prediction_label": sample.prediction_label,
         "prediction_binary": sample.prediction_binary,
+        "prediction_source": sample.prediction_source,
+        "controller_prediction_label": sample.prediction_label,
+        "controller_prediction_binary": sample.prediction_binary,
         "harmfulness_analysis": sample.harmfulness_analysis,
+        "harmfulness_labels": sample.harmfulness_labels,
         "final_answer": sample.final_answer,
         "confidence": sample.final_confidence,
         "status": sample.status,
         "rounds": sample.round_index,
         "reason": sample.final_reason,
+        "retrieval_questions": sample.retrieval_questions,
         "error": sample.error,
-        "last_main_output": _latest_output(sample.main_outputs),
-        "last_controller_decision": (
-            sample.controller_outputs[-1].get("decision", {})
-            if sample.controller_outputs
-            else {}
-        ),
     }
 
 
@@ -1072,9 +1388,6 @@ def _summary(
         "prediction_harmless_count": sum(
             1 for item in records if item["prediction_binary"] == 0
         ),
-        "prediction_unknown_count": sum(
-            1 for item in records if item["prediction_binary"] is None
-        ),
     }
     metrics = _binary_metrics(records)
     return {
@@ -1085,6 +1398,7 @@ def _summary(
         "confidence_threshold": args.confidence_threshold,
         "main_concurrency": args.main_concurrency,
         "controller_concurrency": args.controller_concurrency,
+        "final_concurrency": args.final_concurrency,
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
 
@@ -1167,8 +1481,8 @@ def _extract_harmfulness_section(text: str) -> str:
     if not text:
         return ""
     patterns = (
-        r"(?:^|\n)\s*(?:4[.\)]\s*)?(?:Harmfulness analysis|有害性分析)[:：]?\s*(.*?)(?=\n\s*(?:5[.\)]|Audience and reception prediction|受众|Intent recognition|意图|Evolution tracking|演化|Evidence map|证据地图)\b|\Z)",
-        r"(?:^|\n)\s*(?:Harmfulness|有害性)[:：]\s*(.*?)(?=\n\s*(?:Audience|受众|Intent|意图|Evolution|演化|Evidence|证据)\b|\Z)",
+        r"(?:^|\n)\s*(?:3|4)[.\)]\s*(?:Harmfulness analysis|有害性分析)[:：]?\s*(.*?)(?=\n\s*(?:4|5)[.\)]|Evidence map|证据地图|\Z)",
+        r"(?:^|\n)\s*(?:Harmfulness|有害性)[:：]\s*(.*?)(?=\n\s*(?:Evidence|证据)\b|\Z)",
     )
     for pattern in patterns:
         match = re.search(pattern, text, flags=re.I | re.S)
@@ -1179,19 +1493,32 @@ def _extract_harmfulness_section(text: str) -> str:
 
 def _normalize_prediction_label(value: Any) -> str:
     if value is None or value == "":
-        return "unclear"
-    normalized = str(value).strip().lower().replace("-", "_").replace(" ", "_")
+        return "harmless"
+    raw_value = str(value).strip()
+    normalized = raw_value.lower().replace("-", "_").replace(" ", "_")
     if normalized in {"harmful", "unsafe", "toxic", "offensive"}:
         return "harmful"
     if normalized in {"harmless", "not_harmful", "non_harmful", "nonharmful", "safe"}:
         return "harmless"
-    if normalized in {"unclear", "unknown", "ambiguous"}:
-        return "unclear"
-    if re.search(r"\b(?:harmless|not[_\s-]*harmful|non[_\s-]*harmful|nonharmful)\b", str(value), flags=re.I):
-        return "harmless"
-    if re.search(r"\bharmful\b", str(value), flags=re.I):
+    if raw_value in {"有害", "有害内容"}:
         return "harmful"
-    return "unclear"
+    if raw_value in {"无害", "无害内容"}:
+        return "harmless"
+    if raw_value in {"不明确", "不确定", "无法判断", "证据不足"}:
+        return "harmless"
+    if re.search(
+        r"\b(?:insufficient evidence|not enough evidence|not clearly|not necessarily|not demonstrably)\b.{0,40}\bharmful\b",
+        raw_value,
+        flags=re.I | re.S,
+    ):
+        return "harmless"
+    if re.search(r"(?:不明确|不确定|无法判断|证据不足).{0,20}有害", raw_value):
+        return "harmless"
+    if re.search(r"\b(?:harmless|not[_\s-]*harmful|non[_\s-]*harmful|nonharmful)\b", raw_value, flags=re.I):
+        return "harmless"
+    if re.search(r"\bharmful\b", raw_value, flags=re.I):
+        return "harmful"
+    return "harmless"
 
 
 def _prediction_binary_from_values(
@@ -1199,7 +1526,7 @@ def _prediction_binary_from_values(
     label: str,
     final_answer: str,
     harmfulness_analysis: str,
-) -> int | None:
+) -> int:
     if isinstance(explicit_binary, bool):
         return int(explicit_binary)
     if isinstance(explicit_binary, (int, float)):
@@ -1214,10 +1541,10 @@ def _prediction_binary_from_values(
         if normalized in {"0", "harmless", "not_harmful", "false", "no"}:
             return 0
 
-    normalized_label = _normalize_prediction_label(label)
-    if normalized_label == "harmful":
-        return 1
-    if normalized_label == "harmless":
+    if str(label).strip():
+        normalized_label = _normalize_prediction_label(label)
+        if normalized_label == "harmful":
+            return 1
         return 0
 
     text = f"{harmfulness_analysis}\n{final_answer}".lower().replace("-", "_")
@@ -1225,11 +1552,27 @@ def _prediction_binary_from_values(
         return 0
     if re.search(r"\b(?:prediction_label|final_decision|judgement|label)\s*(?:is|:|：)?\s*harmful\b", text, flags=re.S):
         return 1
+    if re.search(
+        r"\b(?:insufficient evidence|not enough evidence|not clearly|not necessarily|not demonstrably)\b.{0,40}\bharmful\b",
+        text,
+        flags=re.S,
+    ):
+        return 0
+    if re.search(r"(?:不明确|不确定|无法判断|证据不足).{0,20}有害", text):
+        return 0
     if re.search(r"\b(?:harmless|not[_\s]*harmful|non[_\s]*harmful|nonharmful)\b", text, flags=re.S):
         return 0
-    if re.search(r"\bharmful\b", text, flags=re.S):
+    if re.search(
+        r"(?:\b(?:the|this)\s+meme\s+(?:is|appears|seems|is classified as|is judged)\s+harmful\b|(?:^|\n)\s*harmful\s*(?:because|:|：))",
+        text,
+        flags=re.S,
+    ):
         return 1
-    return None
+    if re.search(r"(?:该|这个)?(?:迷因|梗图|表情包|内容).{0,8}(?:是|属于|判定为|可视为)有害", text):
+        return 1
+    if re.search(r"(?:该|这个)?(?:迷因|梗图|表情包|内容).{0,8}(?:是|属于|判定为|可视为)无害", text):
+        return 0
+    return 0
 
 
 def _normalize_string_list(value: Any) -> list[str]:

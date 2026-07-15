@@ -9,6 +9,8 @@ from memeagent.workflow import MemeResearchWorkflow
 class FakeMemeAgent:
     def __init__(self) -> None:
         self.analysis_context = ""
+        self.analysis_image_paths: list[str] = []
+        self.analysis_image_urls: list[str] = []
         self.plan_calls = 0
         self.controller_calls = 0
 
@@ -28,8 +30,17 @@ QUERY_CAUTIONS:
 - Do not assume the first result is authoritative.
 """.strip()
 
-    def run(self, topic: str, context: str, **_: object) -> str:
+    def run(
+        self,
+        topic: str,
+        context: str,
+        image_paths: list[str] | None = None,
+        image_urls: list[str] | None = None,
+        **_: object,
+    ) -> str:
         self.analysis_context = context
+        self.analysis_image_paths = list(image_paths or [])
+        self.analysis_image_urls = list(image_urls or [])
         return f"analysis for {topic}"
 
     def plan_analysis_iteration(self, **_: object) -> str:
@@ -285,6 +296,8 @@ class ForcedRetrievalWorkflowTests(unittest.TestCase):
         self.assertIn("Parsed confidence: 0.90", result.controller_report)
         self.assertIn("Follow-up image analysis confirms OCR", result.visual_report)
         self.assertIn("Controller-Directed Retrieval Round 2", result.search_report)
+        self.assertEqual([], meme_agent.analysis_image_paths)
+        self.assertEqual([], meme_agent.analysis_image_urls)
 
     def test_low_controller_confidence_skips_followup_search_when_search_is_disabled(self) -> None:
         meme_agent = LowThenHighControllerMemeAgent()

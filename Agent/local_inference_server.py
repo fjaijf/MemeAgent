@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import argparse
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 from pathlib import Path
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -51,7 +52,7 @@ class ServerSettings:
     port: int
     command: str
     spawn_vllm: bool
-    startup_timeout_seconds: float
+    startup_timeout_seconds: float | None
     startup_poll_seconds: float
     backend_timeout_seconds: float | None
     trust_remote_code: bool
@@ -132,18 +133,32 @@ class ManagedVLLMProcess:
             cmd,
             env=env,
             text=True,
+            start_new_session=True,
         )
 
     def stop(self) -> None:
         if self.process is None or self.process.poll() is not None:
             return
         print(f"[vLLM:{self.settings.name}] stopping pid={self.process.pid}", flush=True)
-        self.process.terminate()
+        self._terminate_process_group(signal.SIGTERM)
         try:
             self.process.wait(timeout=30)
         except subprocess.TimeoutExpired:
-            self.process.kill()
-            self.process.wait(timeout=10)
+            print(
+                f"[vLLM:{self.settings.name}] did not stop after 30s; "
+                "killing process group",
+                flush=True,
+            )
+            self._terminate_process_group(signal.SIGKILL)
+            try:
+                self.process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                print(
+                    f"[vLLM:{self.settings.name}] process group did not exit "
+                    "within 10s after SIGKILL",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
     def assert_running(self) -> None:
         if self.process is not None and self.process.poll() is not None:
@@ -151,6 +166,19 @@ class ManagedVLLMProcess:
                 f"vLLM process for {self.settings.name!r} exited with code "
                 f"{self.process.returncode}."
             )
+
+    def _terminate_process_group(self, sig: int) -> None:
+        if self.process is None or self.process.poll() is not None:
+            return
+        try:
+            os.killpg(os.getpgid(self.process.pid), sig)
+        except ProcessLookupError:
+            return
+        except OSError:
+            if sig == signal.SIGTERM:
+                self.process.terminate()
+            else:
+                self.process.kill()
 
 
 def _env(name: str, default: str = "") -> str:
@@ -250,7 +278,35 @@ def _model_settings(
     )
 
 
+def _assign_launch_cuda_devices(
+    main: VLLMModelSettings,
+    controller: VLLMModelSettings,
+    value: str,
+) -> tuple[VLLMModelSettings, VLLMModelSettings]:
+    devices = tuple(device.strip() for device in value.split(",") if device.strip())
+    main_count = main.tensor_parallel_size or 1
+    controller_count = controller.tensor_parallel_size or 1
+    required_count = main_count + controller_count
+    if len(devices) < required_count:
+        raise ValueError(
+            "CUDA_VISIBLE_DEVICES provides "
+            f"{len(devices)} device(s), but main tensor parallelism "
+            f"({main_count}) plus controller tensor parallelism "
+            f"({controller_count}) requires at least {required_count}."
+        )
+    return (
+        replace(main, cuda_visible_devices=",".join(devices[:main_count])),
+        replace(
+            controller,
+            cuda_visible_devices=",".join(
+                devices[main_count : main_count + controller_count]
+            ),
+        ),
+    )
+
+
 def _build_settings(project_root: Path) -> ServerSettings:
+    launch_cuda_visible_devices = _env("CUDA_VISIBLE_DEVICES") or None
     load_project_env(project_root)
     config = MemeAgentConfig.from_env()
     main_model = _env("MEMEAGENT_SERVICE_MAIN_MODEL", config.model or "memeagent-main")
@@ -266,32 +322,43 @@ def _build_settings(project_root: Path) -> ServerSettings:
     backend_timeout = _env_float("MEMEAGENT_VLLM_BACKEND_TIMEOUT", config.timeout)
     if backend_timeout is not None and backend_timeout <= 0:
         backend_timeout = None
+    startup_timeout = float(_env("MEMEAGENT_VLLM_STARTUP_TIMEOUT", "3600"))
+    if startup_timeout <= 0:
+        raise ValueError("MEMEAGENT_VLLM_STARTUP_TIMEOUT must be greater than 0.")
+    main = _model_settings(
+        role="main",
+        name=main_model,
+        model_path=_resolve_model_path(
+            "MEMEAGENT_SERVICE_MAIN_MODEL_PATH",
+            config.model,
+        ),
+        host=vllm_host,
+        port=main_port,
+    )
+    controller = _model_settings(
+        role="controller",
+        name=controller_model,
+        model_path=_resolve_model_path(
+            "MEMEAGENT_SERVICE_CONTROLLER_MODEL_PATH",
+            config.controller_model,
+        ),
+        host=vllm_host,
+        port=controller_port,
+    )
+    if launch_cuda_visible_devices:
+        main, controller = _assign_launch_cuda_devices(
+            main,
+            controller,
+            launch_cuda_visible_devices,
+        )
     return ServerSettings(
-        main=_model_settings(
-            role="main",
-            name=main_model,
-            model_path=_resolve_model_path(
-                "MEMEAGENT_SERVICE_MAIN_MODEL_PATH",
-                config.model,
-            ),
-            host=vllm_host,
-            port=main_port,
-        ),
-        controller=_model_settings(
-            role="controller",
-            name=controller_model,
-            model_path=_resolve_model_path(
-                "MEMEAGENT_SERVICE_CONTROLLER_MODEL_PATH",
-                config.controller_model,
-            ),
-            host=vllm_host,
-            port=controller_port,
-        ),
+        main=main,
+        controller=controller,
         host=service_host,
         port=service_port,
         command=_env("MEMEAGENT_VLLM_COMMAND", "vllm"),
         spawn_vllm=_env_bool("MEMEAGENT_VLLM_SPAWN", True),
-        startup_timeout_seconds=float(_env("MEMEAGENT_VLLM_STARTUP_TIMEOUT", "900")),
+        startup_timeout_seconds=startup_timeout,
         startup_poll_seconds=float(_env("MEMEAGENT_VLLM_STARTUP_POLL_SECONDS", "2")),
         backend_timeout_seconds=backend_timeout,
         trust_remote_code=_env_bool("MEMEAGENT_VLLM_TRUST_REMOTE_CODE", True),
@@ -324,10 +391,16 @@ def _wait_for_backend(
     *,
     settings: ServerSettings,
     process: ManagedVLLMProcess | None = None,
+    deadline: float | None = None,
 ) -> None:
-    deadline = time.time() + settings.startup_timeout_seconds
+    timeout = settings.startup_timeout_seconds
+    if timeout is None or timeout <= 0:
+        raise ValueError("vLLM startup timeout must be greater than 0.")
+    started_at = time.monotonic()
+    deadline = deadline if deadline is not None else started_at + timeout
+    next_progress_log = started_at
     models_url = model.backend_url + "/models"
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         if process is not None:
             process.assert_running()
         try:
@@ -341,9 +414,20 @@ def _wait_for_backend(
                 return
         except requests.RequestException:
             pass
+        now = time.monotonic()
+        if now >= next_progress_log:
+            elapsed = now - started_at
+            remaining = max(0.0, deadline - now)
+            print(
+                f"[vLLM:{model.name}] waiting for {model.backend_url} "
+                f"({elapsed:.0f}s elapsed, {remaining:.0f}s remaining)",
+                flush=True,
+            )
+            next_progress_log = now + 30
         time.sleep(settings.startup_poll_seconds)
     raise RuntimeError(
-        f"Timed out waiting for vLLM backend {model.name!r} at {model.backend_url}."
+        f"Timed out after {timeout:.0f}s waiting for vLLM backend "
+        f"{model.name!r} at {model.backend_url}."
     )
 
 
@@ -411,22 +495,35 @@ def create_app(settings: ServerSettings) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        if settings.spawn_vllm:
-            for model in dict.fromkeys(model_routes.values()):
-                process = ManagedVLLMProcess(model, settings)
-                process.start()
-                processes.append(process)
-            for process in processes:
-                _wait_for_backend(process.settings, settings=settings, process=process)
-        else:
-            for model in dict.fromkeys(model_routes.values()):
-                _wait_for_backend(model, settings=settings)
-        print(
-            "MemeAgent vLLM router is ready. "
-            f"Models: {', '.join(sorted(model_routes))}",
-            flush=True,
-        )
         try:
+            timeout = settings.startup_timeout_seconds
+            if timeout is None or timeout <= 0:
+                raise ValueError("vLLM startup timeout must be greater than 0.")
+            startup_deadline = time.monotonic() + timeout
+            if settings.spawn_vllm:
+                for model in dict.fromkeys(model_routes.values()):
+                    process = ManagedVLLMProcess(model, settings)
+                    process.start()
+                    processes.append(process)
+                for process in processes:
+                    _wait_for_backend(
+                        process.settings,
+                        settings=settings,
+                        process=process,
+                        deadline=startup_deadline,
+                    )
+            else:
+                for model in dict.fromkeys(model_routes.values()):
+                    _wait_for_backend(
+                        model,
+                        settings=settings,
+                        deadline=startup_deadline,
+                    )
+            print(
+                "MemeAgent vLLM router is ready. "
+                f"Models: {', '.join(sorted(model_routes))}",
+                flush=True,
+            )
             yield
         finally:
             for process in reversed(processes):
@@ -557,6 +654,10 @@ def main() -> int:
     print(f"  router: {settings.host}:{settings.port}", flush=True)
     print(f"  command: {settings.command}", flush=True)
     print(f"  spawn_vllm: {settings.spawn_vllm}", flush=True)
+    print(
+        f"  startup_timeout: {settings.startup_timeout_seconds:.0f}s",
+        flush=True,
+    )
     print(f"  trust_remote_code: {settings.trust_remote_code}", flush=True)
     print(f"  enable_prefix_caching: {settings.enable_prefix_caching}", flush=True)
     _print_model_settings("main", settings.main)

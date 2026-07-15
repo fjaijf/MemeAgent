@@ -8,7 +8,7 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from .agent import _normalize_content
-from .rubrics import MEME_ANALYSIS_RUBRIC
+from .rubrics import HARMFULNESS_DETECTION_RUBRIC
 
 
 HARMFUL_LABELS = [
@@ -18,7 +18,7 @@ HARMFUL_LABELS = [
     "Vulgar",
     "Antagonism",
 ]
-OUTPUT_LABELS = [*HARMFUL_LABELS, "Not harmful", "Unclear"]
+OUTPUT_LABELS = [*HARMFUL_LABELS, "Harmless"]
 
 
 @dataclass(frozen=True)
@@ -40,7 +40,6 @@ class PerspectiveAgentResult:
     weight: float
     harmful_probability: float
     not_harmful_probability: float
-    unclear_probability: float
     label_probabilities: dict[str, float]
     primary_label: str
     severity: str
@@ -66,7 +65,6 @@ class CounterfactualResult:
 class EnsembleDecision:
     harmful_probability: float
     not_harmful_probability: float
-    unclear_probability: float
     label_probabilities: dict[str, float]
     decision: str
     labels: list[str]
@@ -97,9 +95,10 @@ PERSPECTIVE_AGENTS = [
         ),
         calibration=(
             "Raise harmful_probability when the harmful reading is available without niche background knowledge.",
-            "Use Offensive for direct insults, humiliation, or sensitive-event joking even when framed as humor.",
-            "Use Not harmful when the meme is merely critical, absurd, or self-directed without an identifiable harmed target.",
-            "Use Unclear when target identity or OCR is missing and the image alone is not enough.",
+            "Use Offensive for direct insults, humiliation, victim mockery, or sensitive-event jokes that trivialize harm or target affected people.",
+            "Use Vulgar for profanity, crude insults, sexualized framing, or vulgar gestures when they are visible, even without an identifiable harmed target.",
+            "Use Harmless when the meme is merely critical, absurd, or self-directed and no harmful label is concretely supported.",
+            "Use Harmless with lower confidence when target identity or OCR is missing and the available evidence does not establish harm.",
         ),
         avoid=(
             "Do not over-focus on obscure cultural readings when a mainstream public reading is sufficient.",
@@ -128,7 +127,8 @@ PERSPECTIVE_AGENTS = [
         ),
         calibration=(
             "Raise Discrimination or Offensive when cultural markers plausibly target ethnicity, nationality, religion, caste, region, or language group.",
-            "Raise unclear_probability when a symbol or phrase may be culture-specific but the evidence pack does not resolve it.",
+            "Raise harmful_probability for blanket accusations, ridicule, or stereotype reinforcement aimed at religions, nationalities, genders, political blocs, or supporter groups.",
+            "Lower confidence when a symbol or phrase may be culture-specific but the evidence pack does not resolve it.",
             "Lower confidence if you cannot identify the language, event, or local meme convention.",
             "Use [Inference] explicitly for cultural readings not directly stated by sources.",
         ),
@@ -160,7 +160,7 @@ PERSPECTIVE_AGENTS = [
         calibration=(
             "Lower harmful_probability when evidence strongly supports self-directed coping or consensual in-group bonding.",
             "Do not erase harm if reclaimed or insider language is exported to a broad public audience without context.",
-            "Raise unclear_probability when community membership, speaker identity, or original post context is unknown.",
+            "Lower confidence when community membership, speaker identity, or original post context is unknown.",
             "Use Offensive or Antagonism when in-group framing is weak and the public reading is hostile or humiliating.",
         ),
         avoid=(
@@ -174,7 +174,7 @@ PERSPECTIVE_AGENTS = [
         title="Vulnerable-Group Advocate",
         background=(
             "You review from the perspective of people who may be targeted or harmed. "
-            "You are attentive to stereotypes, dehumanization, sensitive-event joking, "
+            "You are attentive to stereotypes, dehumanization, harmful sensitive-event framing, "
             "social stigma, and cumulative harms to marginalized or vulnerable groups."
         ),
         focus=(
@@ -184,13 +184,14 @@ PERSPECTIVE_AGENTS = [
         checklist=(
             "Identify protected or vulnerable groups, including race, ethnicity, religion, nationality, gender, LGBTQ+ identity, disability, illness, class, migrants, victims, or disaster-affected people.",
             "Check whether humor depends on stereotypes, disgust, animalization, criminalization, contamination, sexualization, or diminished empathy.",
-            "Look for sensitive-event references: disasters, pandemics, racial violence, historical trauma, war, terrorism, death, abuse, or public tragedies.",
+            "Look for sensitive-event framing involving disasters, pandemics, racial violence, historical trauma, war, terrorism, death, abuse, or public tragedies.",
             "Assess cumulative-harm risk: even if indirect, does the meme normalize stigma, mock victims, or invite audience hostility?",
             "Note whether the target is already socially powerful or vulnerable in the specific context.",
         ),
         calibration=(
-            "Raise harmful_probability for dehumanization, victim mockery, stigma reinforcement, or sensitive-event joking.",
-            "Use Offensive for any sensitive-event reference under the project rubric, even if the meme claims sarcasm or neutrality.",
+            "Raise harmful_probability for dehumanization, victim mockery, stigma reinforcement, or sensitive-event framing that trivializes harm, targets affected people, or invites contempt.",
+            "Raise harmful_probability when public-health crises, disasters, deaths, abuse, war, terrorism, or historical trauma are used as entertainment framing, game mechanics, or disposable punchlines.",
+            "Use Offensive only when a sensitive-event reference is framed as mockery, contempt, trivialization, targeting, or exploitation; otherwise use Harmless with lower confidence when stance or target is unresolved.",
             "Use Discrimination when the harm is tied to protected/social identity rather than generic dislike.",
             "Keep confidence tied to evidence; advocacy lens should surface risk, not invent targets.",
         ),
@@ -222,8 +223,9 @@ PERSPECTIVE_AGENTS = [
         calibration=(
             "Lower harmful_probability when evidence shows the meme condemns harmful behavior rather than endorsing it.",
             "Raise Antagonism when communicative force is hostile, nihilistic, or resentment-amplifying without constructive target.",
+            "Raise Antagonism or Offensive for hostile group attribution, blanket accusation, humiliation, or contempt toward political, religious, gender, national, or supporter groups.",
             "Raise Violence only when violence is endorsed, threatened, celebrated, or graphically depicted, not merely mentioned critically.",
-            "Raise unclear_probability when stance reversal or quotation cannot be resolved.",
+            "Lower confidence when stance reversal or quotation cannot be resolved.",
         ),
         avoid=(
             "Do not take ironic text at face value without checking stance and target direction.",
@@ -236,8 +238,9 @@ PERSPECTIVE_AGENTS = [
         title="Conservative Evidence Reviewer",
         background=(
             "You are a conservative evidence reviewer. You avoid over-calling harmfulness "
-            "when image, user context, or retrieved evidence is weak. You should raise "
-            "Unclear when the target, event, or intent is unsupported."
+            "when image, user context, or retrieved evidence is weak. Choose Harmless "
+            "with lower confidence only when no harmfulness label is concretely supported; "
+            "do not reject Vulgar or Violence solely because target, event, or intent is unsupported."
         ),
         focus=(
             "Audit evidentiary sufficiency. Your job is to prevent overconfident harmfulness calls "
@@ -248,11 +251,13 @@ PERSPECTIVE_AGENTS = [
             "Check whether source tags actually support the target, event, platform, date, and intended meaning.",
             "Identify missing OCR, cropped text, ambiguous faces/symbols, weak search results, or unsupported cultural references.",
             "Ask whether a less harmful interpretation remains plausible under the available evidence.",
-            "Specify exactly what additional evidence would move the decision from Unclear to harmful or not harmful.",
+            "Specify exactly what additional evidence could change the binary harmful or harmless decision.",
         ),
         calibration=(
-            "Raise unclear_probability and lower confidence whenever target or intent is ambiguous.",
-            "Use Not harmful only when direct evidence supports benign interpretation, not merely because evidence is absent.",
+            "Lower confidence whenever target or intent is ambiguous.",
+            "Use Harmless when the available evidence does not establish any concrete harmfulness label.",
+            "Do not require a protected-group target, named target, or complete speaker intent for Vulgar when OCR/image evidence shows sexual, obscene, profane, crude, insult-gesture, coercive, or otherwise vulgar content.",
+            "Do not use missing context alone to override visible sensitive-event trivialization, group hostility, profanity, vulgar gestures, or sexualized framing.",
             "Use harmful labels despite conservatism when direct image/OCR evidence clearly satisfies the rubric.",
             "Prefer narrow labels over broad labels; do not assign multiple labels without separate evidence for each.",
         ),
@@ -309,7 +314,10 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
 def _normalize_label(value: Any) -> str:
     text = str(value or "").strip()
     lookup = {label.lower(): label for label in OUTPUT_LABELS}
-    return lookup.get(text.lower(), "Unclear")
+    legacy_harmless = {"not harmful"}
+    if text.lower() in legacy_harmless:
+        return "Harmless"
+    return lookup.get(text.lower(), "Harmless")
 
 
 def _normalize_severity(value: Any) -> str:
@@ -412,7 +420,7 @@ Shared evidence pack:
 {evidence_context or "None"}
 
 Project harmfulness rubric:
-{MEME_ANALYSIS_RUBRIC}
+{HARMFULNESS_DETECTION_RUBRIC}
 
 Perspective assignment:
 - Agent title: {spec.title}
@@ -433,7 +441,6 @@ JSON schema:
 {{
   "harmful_probability": 0.0,
   "not_harmful_probability": 0.0,
-  "unclear_probability": 0.0,
   "label_probabilities": {{
     "Discrimination": 0.0,
     "Offensive": 0.0,
@@ -441,7 +448,7 @@ JSON schema:
     "Vulgar": 0.0,
     "Antagonism": 0.0
   }},
-  "primary_label": "Discrimination|Offensive|Violence|Vulgar|Antagonism|Not harmful|Unclear",
+  "primary_label": "Discrimination|Offensive|Violence|Vulgar|Antagonism|Harmless",
   "severity": "high|medium|low|none|unknown",
   "confidence": 0.0,
   "key_evidence": [
@@ -453,10 +460,10 @@ JSON schema:
 
 Rules:
 - Treat harmful labels as multi-label probabilities; they do not need to sum to 1.
-- harmful_probability, not_harmful_probability, and unclear_probability should reflect the overall decision.
-- Apply the project rule that any reference to sensitive events is Offensive.
+- harmful_probability and not_harmful_probability must sum to 1.0 and reflect the binary decision.
 - Do not invent source IDs, targets, events, platforms, or dates.
-- If evidence is weak, increase unclear_probability and lower confidence.
+- Do not treat sensitive-event references as automatically Offensive; require evidence of mockery, targeting, trivialization, exploitation, or another harm mechanism.
+- If evidence is weak and no concrete harm mechanism is established, choose Harmless and lower confidence.
 - Do not copy the same rationale that another reviewer would give; emphasize your lens.
 - Make probabilities calibrated: avoid defaulting to 0.50/0.50 unless the evidence is genuinely balanced.
 """.strip()
@@ -485,18 +492,22 @@ Rules:
 
         harmful_probability = _clamp(parsed.get("harmful_probability"))
         not_harmful_probability = _clamp(parsed.get("not_harmful_probability"))
-        unclear_probability = _clamp(parsed.get("unclear_probability"))
         if not parsed:
             harmful_probability = 0.0
-            not_harmful_probability = 0.0
-            unclear_probability = 1.0
+            not_harmful_probability = 1.0
+        probability_total = harmful_probability + not_harmful_probability
+        if probability_total <= 0.0:
+            harmful_probability = 0.0
+            not_harmful_probability = 1.0
+        else:
+            harmful_probability /= probability_total
+            not_harmful_probability /= probability_total
         return PerspectiveAgentResult(
             agent_name=spec.name,
             title=spec.title,
             weight=spec.weight,
             harmful_probability=harmful_probability,
             not_harmful_probability=not_harmful_probability,
-            unclear_probability=unclear_probability,
             label_probabilities=label_probabilities,
             primary_label=_normalize_label(parsed.get("primary_label")),
             severity=_normalize_severity(parsed.get("severity")),
@@ -534,7 +545,6 @@ Perspective vote summary:
 Preliminary soft vote:
 - harmful_probability: {_format_probability(preliminary.harmful_probability)}
 - not_harmful_probability: {_format_probability(preliminary.not_harmful_probability)}
-- unclear_probability: {_format_probability(preliminary.unclear_probability)}
 - labels: {label_summary}
 - severity: {preliminary.severity}
 - confidence: {_format_probability(preliminary.confidence)}
@@ -689,12 +699,11 @@ Rules:
         if not results:
             return EnsembleDecision(
                 harmful_probability=0.0,
-                not_harmful_probability=0.0,
-                unclear_probability=1.0,
+                not_harmful_probability=1.0,
                 label_probabilities={label: 0.0 for label in HARMFUL_LABELS},
-                decision="unclear",
-                labels=["Unclear"],
-                severity="unknown",
+                decision="harmless",
+                labels=[],
+                severity="none",
                 confidence=0.0,
             )
 
@@ -709,10 +718,6 @@ Rules:
         ) / total_weight
         not_harmful_probability = sum(
             result.not_harmful_probability * weight
-            for result, weight in zip(results, weights)
-        ) / total_weight
-        unclear_probability = sum(
-            result.unclear_probability * weight
             for result, weight in zip(results, weights)
         ) / total_weight
         label_probabilities = {
@@ -753,25 +758,25 @@ Rules:
                     + counterfactual.label_probability_deltas.get(label, 0.0)
                 )
 
+        probability_total = harmful_probability + not_harmful_probability
+        if probability_total <= 0.0:
+            harmful_probability = 0.0
+            not_harmful_probability = 1.0
+        else:
+            harmful_probability /= probability_total
+            not_harmful_probability /= probability_total
+
         selected_labels = [
             label for label, probability in label_probabilities.items() if probability >= 0.35
         ]
-        if harmful_probability >= 0.65:
+        if harmful_probability >= 0.50:
             decision = "harmful"
-            if not selected_labels:
-                selected_labels = [max(label_probabilities, key=label_probabilities.get)]
-        elif harmful_probability >= 0.45 or unclear_probability >= 0.35:
-            decision = "unclear"
-            if not selected_labels:
-                selected_labels = ["Unclear"]
         else:
-            decision = "not harmful"
-            selected_labels = ["Not harmful"]
+            decision = "harmless"
+            selected_labels = []
 
-        if decision == "not harmful":
+        if decision == "harmless":
             severity = "none"
-        elif decision == "unclear" and not selected_labels:
-            severity = "unknown"
         else:
             severity = _score_to_severity(severity_score)
             if decision == "harmful" and severity == "none":
@@ -780,7 +785,6 @@ Rules:
         return EnsembleDecision(
             harmful_probability=harmful_probability,
             not_harmful_probability=not_harmful_probability,
-            unclear_probability=unclear_probability,
             label_probabilities=label_probabilities,
             decision=decision,
             labels=selected_labels,
@@ -798,7 +802,6 @@ Rules:
             lines.append(
                 f"- {result.title}: harmful={_format_probability(result.harmful_probability)}, "
                 f"not_harmful={_format_probability(result.not_harmful_probability)}, "
-                f"unclear={_format_probability(result.unclear_probability)}, "
                 f"primary={result.primary_label}, severity={result.severity}, "
                 f"confidence={_format_probability(result.confidence)}, labels=({labels})"
             )
@@ -860,6 +863,8 @@ Rules:
             final_decision.harmful_probability - preliminary.harmful_probability
         )
         final_labels = ", ".join(final_decision.labels)
+        if not final_labels:
+            final_labels = "None"
         uncertainties = (
             "\n".join(f"- {item}" for item in deduped_uncertainties)
             if deduped_uncertainties
@@ -872,7 +877,6 @@ Rules:
    - harmfulness_labels: {final_labels}
    - harmful_probability: {_format_probability(final_decision.harmful_probability)}
    - not_harmful_probability: {_format_probability(final_decision.not_harmful_probability)}
-   - unclear_probability: {_format_probability(final_decision.unclear_probability)}
    - severity: {final_decision.severity}
    - confidence: {_confidence_label(final_decision.confidence)} ({_format_probability(final_decision.confidence)})
 
@@ -894,7 +898,7 @@ Rules:
 
 6. Final rationale
    - 软投票先聚合不同背景子智能体的有害性概率，再用反事实推理检查结论是否依赖脆弱假设。
-   - 最终标签来自概率阈值和多标签概率：harmful >= 0.65 判为 harmful；0.45-0.65 或不确定性较高判为 unclear；低于 0.45 判为 not harmful。
+   - 最终标签严格二分类：harmful_probability >= 0.50 判为 harmful，否则判为 harmless；证据局限只影响 confidence，不产生第三类。
    - 所有关键判断应回到 [Image]、[User Context]、[W#]、[N#]、[R#-W#] 或 [Inference] 证据标签。
 
 7. Uncertainty and missing evidence
