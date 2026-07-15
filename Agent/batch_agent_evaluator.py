@@ -3,10 +3,13 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import hashlib
 import json
 import mimetypes
 import os
 import re
+import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -385,7 +388,15 @@ def main() -> int:
 
     final_records = [_final_record(sample) for sample in samples]
     _write_jsonl(output_dir / "final_results.jsonl", final_records)
-    summary = _summary(final_records, args=args, output_dir=output_dir)
+    summary = _summary(
+        final_records,
+        args=args,
+        output_dir=output_dir,
+        project_root=project_root,
+        main_model=main_model,
+        controller_model=controller_model,
+        endpoint=endpoint,
+    )
     _write_json(output_dir / "summary.json", summary)
     print(
         "Done: "
@@ -1263,6 +1274,14 @@ def _context_value(row: dict[str, Any]) -> str:
 
 
 def _judgement_value(row: dict[str, Any]) -> str:
+    judgement = row.get("gold_judgement")
+    if judgement is not None and str(judgement).strip():
+        return str(judgement).strip()
+
+    binary = row.get("gold_binary", row.get("label"))
+    if binary in {0, 1, "0", "1"}:
+        return "JUDGEMENT: harmful" if int(binary) == 1 else "JUDGEMENT: harmless"
+
     conversations = row.get("conversations")
     if isinstance(conversations, list):
         for message in conversations:
@@ -1374,6 +1393,10 @@ def _summary(
     *,
     args: argparse.Namespace,
     output_dir: Path,
+    project_root: Path,
+    main_model: str,
+    controller_model: str,
+    endpoint: ChatEndpoint,
 ) -> dict[str, Any]:
     counts = {
         "total": len(records),
@@ -1399,8 +1422,114 @@ def _summary(
         "main_concurrency": args.main_concurrency,
         "controller_concurrency": args.controller_concurrency,
         "final_concurrency": args.final_concurrency,
+        "experiment": _experiment_metadata(
+            args=args,
+            project_root=project_root,
+            main_model=main_model,
+            controller_model=controller_model,
+            endpoint=endpoint,
+        ),
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
+
+
+def _experiment_metadata(
+    *,
+    args: argparse.Namespace,
+    project_root: Path,
+    main_model: str,
+    controller_model: str,
+    endpoint: ChatEndpoint,
+) -> dict[str, Any]:
+    return {
+        "entrypoint": Path(sys.argv[0]).name,
+        "command": [sys.executable, *_redacted_argv(sys.argv)],
+        "dataset": str(Path(args.dataset).expanduser()) if args.dataset else "",
+        "image_dir": str(Path(args.image_dir).expanduser()) if args.image_dir else "",
+        "image_root": str(Path(args.image_root).expanduser()) if args.image_root else "",
+        "offset": args.offset,
+        "limit": args.limit,
+        "base_url": endpoint.base_url,
+        "main_model": main_model,
+        "controller_model": controller_model,
+        "final_model": main_model,
+        "main_temperature": args.temperature,
+        "controller_temperature": args.controller_temperature,
+        "main_max_tokens": _optional_positive(args.main_max_tokens),
+        "controller_max_tokens": _optional_positive(args.controller_max_tokens),
+        "final_max_tokens": _optional_positive(args.final_max_tokens),
+        "timeout": args.timeout,
+        "retries": args.retries,
+        "strip_thinking": endpoint.strip_thinking,
+        "save_prompts": args.save_prompts,
+        "decision_policy": {
+            "prediction_owner": "controller",
+            "final_model_can_override_prediction": False,
+            "hard_judgement_rules_enabled": False,
+            "output_normalization_fallbacks_enabled": True,
+        },
+        "source": _source_metadata(project_root),
+    }
+
+
+def _redacted_argv(argv: list[str]) -> list[str]:
+    redacted: list[str] = []
+    hide_next = False
+    for argument in argv:
+        if hide_next:
+            redacted.append("<redacted>")
+            hide_next = False
+            continue
+        if argument == "--api-key":
+            redacted.append(argument)
+            hide_next = True
+            continue
+        if argument.startswith("--api-key="):
+            redacted.append("--api-key=<redacted>")
+            continue
+        redacted.append(argument)
+    return redacted
+
+
+def _source_metadata(project_root: Path) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "git_commit": None,
+        "git_dirty": None,
+        "file_sha256": {},
+    }
+    for relative_path in (
+        "batch_agent_evaluator.py",
+        "batch_agent_evaluator_main_as_controller.py",
+        "memeagent/agent.py",
+    ):
+        path = project_root / relative_path
+        if path.is_file():
+            metadata["file_sha256"][relative_path] = hashlib.sha256(
+                path.read_bytes()
+            ).hexdigest()
+
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=project_root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=project_root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        metadata["git_commit"] = commit.stdout.strip() or None
+        metadata["git_dirty"] = bool(status.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return metadata
 
 
 def _binary_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:

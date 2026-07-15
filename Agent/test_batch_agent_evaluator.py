@@ -20,6 +20,7 @@ from batch_agent_evaluator import (
     _normalize_controller_decision,
     _normalize_prediction_label,
     _prediction_binary_from_values,
+    _redacted_argv,
 )
 
 
@@ -34,6 +35,26 @@ class FakeEndpoint:
 
 
 class BatchAgentEvaluatorTests(unittest.TestCase):
+    def test_command_metadata_redacts_api_key(self) -> None:
+        self.assertEqual(
+            [
+                "batch_agent_evaluator.py",
+                "--api-key",
+                "<redacted>",
+                "--dataset=data.jsonl",
+                "--api-key=<redacted>",
+            ],
+            _redacted_argv(
+                [
+                    "batch_agent_evaluator.py",
+                    "--api-key",
+                    "secret-one",
+                    "--dataset=data.jsonl",
+                    "--api-key=secret-two",
+                ]
+            ),
+        )
+
     def test_final_record_excludes_duplicate_intermediate_outputs(self) -> None:
         sample = SampleState(
             sample_id="sample-1",

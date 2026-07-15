@@ -25,6 +25,9 @@ import requests
 from memeagent.config import MemeAgentConfig, load_project_env
 
 
+QWEN35_9B_MODEL_PATH = "/data/ggbond/Qwen3.5-9B"
+
+
 @dataclass(frozen=True)
 class VLLMModelSettings:
     name: str
@@ -310,15 +313,10 @@ def _build_settings(project_root: Path) -> ServerSettings:
     load_project_env(project_root)
     config = MemeAgentConfig.from_env()
     main_model = _env("MEMEAGENT_SERVICE_MAIN_MODEL", config.model or "memeagent-main")
-    controller_model = _env(
-        "MEMEAGENT_SERVICE_CONTROLLER_MODEL",
-        config.controller_model or "memeagent-controller",
-    )
     service_host = _env("MEMEAGENT_SERVICE_HOST", "127.0.0.1")
     service_port = int(_env("MEMEAGENT_SERVICE_PORT", "8008"))
     vllm_host = _env("MEMEAGENT_VLLM_HOST", "127.0.0.1")
     main_port = int(_env("MEMEAGENT_VLLM_MAIN_PORT", "8009"))
-    controller_port = int(_env("MEMEAGENT_VLLM_CONTROLLER_PORT", "8010"))
     backend_timeout = _env_float("MEMEAGENT_VLLM_BACKEND_TIMEOUT", config.timeout)
     if backend_timeout is not None and backend_timeout <= 0:
         backend_timeout = None
@@ -328,32 +326,30 @@ def _build_settings(project_root: Path) -> ServerSettings:
     main = _model_settings(
         role="main",
         name=main_model,
-        model_path=_resolve_model_path(
-            "MEMEAGENT_SERVICE_MAIN_MODEL_PATH",
-            config.model,
-        ),
+        model_path=QWEN35_9B_MODEL_PATH,
         host=vllm_host,
         port=main_port,
     )
-    controller = _model_settings(
-        role="controller",
-        name=controller_model,
-        model_path=_resolve_model_path(
-            "MEMEAGENT_SERVICE_CONTROLLER_MODEL_PATH",
-            config.controller_model,
-        ),
-        host=vllm_host,
-        port=controller_port,
-    )
     if launch_cuda_visible_devices:
-        main, controller = _assign_launch_cuda_devices(
+        required_count = main.tensor_parallel_size or 1
+        devices = tuple(
+            device.strip()
+            for device in launch_cuda_visible_devices.split(",")
+            if device.strip()
+        )
+        if len(devices) < required_count:
+            raise ValueError(
+                "CUDA_VISIBLE_DEVICES provides "
+                f"{len(devices)} device(s), but main tensor parallelism "
+                f"({required_count}) requires at least {required_count}."
+            )
+        main = replace(
             main,
-            controller,
-            launch_cuda_visible_devices,
+            cuda_visible_devices=",".join(devices[:required_count]),
         )
     return ServerSettings(
         main=main,
-        controller=controller,
+        controller=main,
         host=service_host,
         port=service_port,
         command=_env("MEMEAGENT_VLLM_COMMAND", "vllm"),
@@ -660,8 +656,7 @@ def main() -> int:
     )
     print(f"  trust_remote_code: {settings.trust_remote_code}", flush=True)
     print(f"  enable_prefix_caching: {settings.enable_prefix_caching}", flush=True)
-    _print_model_settings("main", settings.main)
-    _print_model_settings("controller", settings.controller)
+    _print_model_settings("Qwen3.5-9B", settings.main)
     if args.dry_run:
         return 0
 
